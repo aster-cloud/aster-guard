@@ -5,7 +5,7 @@ import type { GuardPrincipal } from '../types.js';
 import { hasControlChar, MAX_ROLES, MAX_TEXT_LENGTH } from './action-limits.js';
 
 /** 缺省的 API key 环境变量名。API key 只从环境变量读取，不接受命令行传入（argv 对同机其他进程可见）。 */
-export const DEFAULT_API_KEY_ENV = 'ASTER_GUARD_API_KEY';
+const DEFAULT_API_KEY_ENV = 'ASTER_GUARD_API_KEY';
 
 /** 缺省的人工审批等待秒数（§6）。 */
 const DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300;
@@ -220,7 +220,7 @@ function parseUpstream(commandLine: string): { command: string; args: string[] }
 const WORD_PIECE = /\s*(?:([^\s\\'"]+)|'([^']*)'|"((?:[^"\\]|\\.)*)"|(\\.?)|(\S))(\s)?/sy;
 
 /** 按 POSIX shell 的引号规则切分命令行；引号未闭合抛 ConfigError。 */
-export function splitShellWords(line: string): string[] {
+function splitShellWords(line: string): string[] {
   const words: string[] = [];
   // undefined 表示当前没有进行中的词；'' 是合法的词（来自 '' 或 ""）。
   let word: string | undefined;

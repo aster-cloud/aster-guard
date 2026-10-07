@@ -1,7 +1,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createGuardProxyServer, type GuardClientLike } from '../src/mcp/proxy.js';
+import { createGuardProxyServer, type GuardClientLike } from '../src/mcp/index.js';
 import type { GuardDecision } from '../src/types.js';
 
 // 无上游时的五个治理工具：一一对应 GuardClient 方法，结果以 JSON 文本返回（ADR 0040 §6）。

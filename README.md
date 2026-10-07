@@ -126,6 +126,8 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 
 上游子进程继承代理的环境变量，但不包含 API key 所在的那个变量。stdout 是 MCP 通道，日志一律写 stderr。退出码：`0` 正常结束（含 `--help`），`1` 上游无法启动、意外断开或对下游的 stdio 通道建立失败（此时先关闭上游子进程），`2` 参数错误。
 
+要在宿主侧程序里嵌入代理（自行提供 transport 与已连接的上游 `Client`），可从子路径导入：`import { createGuardProxyServer } from '@aster-cloud/aster-guard/mcp'`，选项与 CLI 参数一一对应（`approvalTimeoutMs`、`upstreamTimeoutMs`、`resourceFromArg`、`agentModel`）。
+
 Claude Desktop 配置示例（`claude_desktop_config.json`）：
 
 ```json
@@ -307,7 +309,7 @@ node scripts/e2e-local.mjs
 ```bash
 pnpm install
 pnpm run typecheck   # tsc --noEmit，仅覆盖 src
-pnpm run lint        # eslint src test
+pnpm run lint        # eslint src test scripts（.ts 用 typescript-eslint，.mjs 用 @eslint/js）
 pnpm test            # 先 build，再 vitest run（含 dist 入口测试）
 pnpm run build       # tsc → dist/
 ```

@@ -17,7 +17,7 @@ import {
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { createGuardProxyServer, type GuardClientLike, type GuardProxyOptions } from '../src/mcp/proxy.js';
+import { createGuardProxyServer, type GuardClientLike, type GuardProxyOptions } from '../src/mcp/index.js';
 import type { GuardDecision } from '../src/types.js';
 
 // 代理集成测试：内存 MCP 上游（假服务器）+ mock GuardClient + SDK Client（ADR 0040 §6）。

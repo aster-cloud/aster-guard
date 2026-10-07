@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, parseCliArgs, splitShellWords, upstreamEnv, USAGE, wantsHelp } from '../src/mcp/config.js';
+import { ConfigError, parseCliArgs, upstreamEnv, USAGE, wantsHelp } from '../src/mcp/config.js';
 
 // CLI 参数 / 环境变量解析（zod 校验）。API key 只从环境变量读取，绝不出现在 argv 中。
 
@@ -181,7 +181,7 @@ describe('wantsHelp', () => {
   });
 });
 
-describe('splitShellWords', () => {
+describe('--upstream 按 shell 规则切分', () => {
   it.each([
     ["node server.js --flag 'a b'", ['node', 'server.js', '--flag', 'a b']],
     ['  npx   -y  pkg  ', ['npx', '-y', 'pkg']],
@@ -190,14 +190,16 @@ describe('splitShellWords', () => {
     ['cmd a\\ b', ['cmd', 'a b']],
     ["cmd '' \"\"", ['cmd', '', '']],
     ["cmd '\\n'", ['cmd', '\\n']],
-    ['', []],
-  ])('%j', (input, expected) => {
-    expect(splitShellWords(input)).toEqual(expected);
+  ])('%j', (input, [command, ...args]) => {
+    expect(parseCliArgs([...REQUIRED, '--upstream', input], ENV).upstream).toEqual({ command, args });
   });
 
-  it('引号未闭合 → ConfigError', () => {
-    expect(() => splitShellWords('cmd "abc')).toThrow(ConfigError);
-    expect(() => splitShellWords("cmd 'abc")).toThrow(ConfigError);
+  it.each([
+    ['双引号未闭合', 'cmd "abc'],
+    ['单引号未闭合', "cmd 'abc"],
+    ['空命令', ''],
+  ])('%s → ConfigError', (_label, input) => {
+    expect(() => parseCliArgs([...REQUIRED, '--upstream', input], ENV)).toThrow(ConfigError);
   });
 });
 

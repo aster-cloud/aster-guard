@@ -5,10 +5,10 @@ import type { GuardClient } from '../client.js';
 import type { GuardDecision, GuardPrincipal } from '../types.js';
 
 /** 治理工具用到的 GuardClient 方法。 */
-export type GovernanceClient = Pick<GuardClient, 'check' | 'get' | 'listApprovals' | 'approve' | 'reject'>;
+type GovernanceClient = Pick<GuardClient, 'check' | 'get' | 'listApprovals' | 'approve' | 'reject'>;
 
 /** 治理工具的运行依赖：主体与模型来自代理配置，工具参数不能改写（Agent 不得自报身份）。 */
-export interface GovernanceContext {
+interface GovernanceContext {
   client: GovernanceClient;
   principal: GuardPrincipal;
   agentModel?: string;
