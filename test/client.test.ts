@@ -1,0 +1,348 @@
+import { describe, expect, it, vi } from 'vitest';
+import { GuardClient, type GuardClientOptions, type GuardDecision } from '../src/index.js';
+
+// 单元测试：注入 vi.fn() 作为 fetch，不发真实网络请求（ADR 0040 §6）。
+
+const BASE_OPTIONS = {
+  baseUrl: 'https://guard.example/',
+  apiKey: 'ak_test',
+  policyModule: 'acme.guard',
+  policyFunction: 'decide',
+  principal: { id: 'agent-7', type: 'agent', roles: ['support'] },
+} satisfies GuardClientOptions;
+
+const ALLOW: GuardDecision = {
+  controls: ['GDPR:ART17'],
+  decisionId: 'd-1',
+  effectiveOutcome: 'ALLOW',
+  outcome: 'ALLOW',
+  policyVersion: { id: 1730890123456, sourceHash: 'abc', version: 3 },
+  receipt: { auditId: 88213, hash: 'h1', prevHash: 'h0' },
+  ruleId: 'CUST-DEL-001',
+};
+
+const PENDING: GuardDecision = {
+  approval: { expiresAt: '2026-10-08T05:12:00Z', id: 'a-1', requiredRole: 'DPO', status: 'PENDING' },
+  decisionId: 'd-1',
+  effectiveOutcome: 'PENDING',
+  outcome: 'REQUIRE_APPROVAL',
+  role: 'DPO',
+};
+
+const ACTION = {
+  action: { name: 'customer.delete' },
+  resource: { type: 'customer', id: 'c-42' },
+  context: { reason: 'gdpr request', count: 1 },
+};
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+/** 把 fetch 的第 n 次调用还原为 { url, method, headers, body }，便于断言。 */
+function request(fetchMock: ReturnType<typeof vi.fn>, n = 0) {
+  const [url, init] = fetchMock.mock.calls[n] as [string, RequestInit];
+  return {
+    url,
+    method: init.method,
+    headers: new Headers(init.headers),
+    body: init.body === undefined ? undefined : JSON.parse(init.body as string),
+  };
+}
+
+function client(fetchMock: ReturnType<typeof vi.fn>, extra: Partial<GuardClientOptions> = {}): GuardClient {
+  return new GuardClient({ ...BASE_OPTIONS, fetch: fetchMock as unknown as typeof fetch, ...extra });
+}
+
+function deny(reasonCode: string, decisionId = ''): Partial<GuardDecision> {
+  return { decisionId, outcome: 'DENY', effectiveOutcome: 'DENY', reasonCode };
+}
+
+describe('GuardClient 构造', () => {
+  it('缺少 baseUrl 或 apiKey 属于编程错误，构造时抛出', () => {
+    expect(() => new GuardClient({ ...BASE_OPTIONS, baseUrl: '' })).toThrow(/baseUrl/);
+    expect(() => new GuardClient({ ...BASE_OPTIONS, apiKey: '' })).toThrow(/apiKey/);
+  });
+});
+
+describe('GuardClient.check', () => {
+  it('发送正确的路径、头与请求体（principal 缺省取配置）', async () => {
+    const fetchMock = vi.fn(async () => json(200, ALLOW));
+    await client(fetchMock).check(ACTION, { idempotencyKey: 'k-1', waitSeconds: 5 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const req = request(fetchMock);
+    expect(req.url).toBe('https://guard.example/api/v1/guard/decisions');
+    expect(req.method).toBe('POST');
+    expect(req.headers.get('Authorization')).toBe('Bearer ak_test');
+    expect(req.headers.get('Content-Type')).toBe('application/json');
+    expect(req.headers.get('Idempotency-Key')).toBe('k-1');
+    expect(req.body).toEqual({
+      policyModule: 'acme.guard',
+      policyFunction: 'decide',
+      action: { ...ACTION, principal: BASE_OPTIONS.principal },
+      waitSeconds: 5,
+    });
+  });
+
+  it('action 自带 principal 时优先于配置；未给 waitSeconds 时不发送该字段', async () => {
+    const fetchMock = vi.fn(async () => json(200, ALLOW));
+    const principal = { id: 'user-1' };
+    await client(fetchMock).check({ ...ACTION, principal });
+
+    const body = request(fetchMock).body;
+    expect(body.action.principal).toEqual(principal);
+    expect(body).not.toHaveProperty('waitSeconds');
+  });
+
+  it('未提供 idempotencyKey 时每次尝试生成不同的 UUID', async () => {
+    const fetchMock = vi.fn(async () => json(200, ALLOW));
+    const guard = client(fetchMock);
+    await guard.check(ACTION);
+    await guard.check(ACTION);
+
+    const k1 = request(fetchMock, 0).headers.get('Idempotency-Key');
+    const k2 = request(fetchMock, 1).headers.get('Idempotency-Key');
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    expect(k1).toMatch(uuid);
+    expect(k2).toMatch(uuid);
+    expect(k1).not.toBe(k2);
+  });
+
+  it('200 ALLOW 原样返回', async () => {
+    const fetchMock = vi.fn(async () => json(200, ALLOW));
+    await expect(client(fetchMock).check(ACTION)).resolves.toEqual(ALLOW);
+  });
+
+  it('500 → DENY http_500', async () => {
+    const fetchMock = vi.fn(async () => new Response('<html>boom</html>', { status: 500 }));
+    const d = await client(fetchMock).check(ACTION);
+    expect(d).toMatchObject(deny('http_500'));
+    expect(d.reason).toBeTruthy();
+  });
+
+  it('400 invalid_action → DENY http_400，reason 取服务端 message', async () => {
+    const fetchMock = vi.fn(async () => json(400, { error: 'invalid_action', message: 'principal.id 必填' }));
+    await expect(client(fetchMock).check(ACTION)).resolves.toMatchObject({
+      ...deny('http_400'),
+      reason: 'principal.id 必填',
+    });
+  });
+
+  it('422 → DENY idempotency_mismatch', async () => {
+    const fetchMock = vi.fn(async () => json(422, { error: 'idempotency_mismatch', message: 'key 已绑定其他动作' }));
+    await expect(client(fetchMock).check(ACTION)).resolves.toMatchObject(deny('idempotency_mismatch'));
+  });
+
+  it('网络错误 → DENY client_error，不抛异常', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    });
+    await expect(client(fetchMock).check(ACTION)).resolves.toMatchObject({
+      ...deny('client_error'),
+      reason: 'fetch failed',
+    });
+  });
+
+  it('2xx 但响应体不是合法 JSON → DENY client_error', async () => {
+    const fetchMock = vi.fn(async () => new Response('not json', { status: 200 }));
+    await expect(client(fetchMock).check(ACTION)).resolves.toMatchObject(deny('client_error'));
+  });
+
+  it('2xx 但 effectiveOutcome 不在三值内 → DENY client_error（不把未知结论当放行）', async () => {
+    const fetchMock = vi.fn(async () => json(200, { decisionId: 'd-9', outcome: 'ALLOW', effectiveOutcome: 'YES' }));
+    await expect(client(fetchMock).check(ACTION)).resolves.toMatchObject(deny('client_error'));
+  });
+
+  it('超时（fetch 等待 AbortSignal）→ DENY client_timeout', async () => {
+    const fetchMock = vi.fn(
+      (_url: string, init: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        }),
+    );
+    const d = await client(fetchMock, { timeoutMs: 20 }).check(ACTION);
+    expect(d).toMatchObject(deny('client_timeout'));
+    expect(request(fetchMock).headers.get('Idempotency-Key')).toBeTruthy();
+  });
+
+  it('fetch 忽略 AbortSignal 永不返回时同样按时 DENY client_timeout', async () => {
+    const fetchMock = vi.fn(() => new Promise<Response>(() => undefined));
+    await expect(client(fetchMock, { timeoutMs: 20 }).check(ACTION)).resolves.toMatchObject(deny('client_timeout'));
+  });
+
+  it('waitSeconds 让服务端等待时，客户端超时相应延长', async () => {
+    const fetchMock = vi.fn(
+      () => new Promise<Response>((resolve) => setTimeout(() => resolve(json(200, ALLOW)), 60)),
+    );
+    await expect(client(fetchMock, { timeoutMs: 20 }).check(ACTION, { waitSeconds: 1 })).resolves.toEqual(ALLOW);
+  });
+
+  it('既无 action.principal 也无配置 principal → DENY client_error，不发请求', async () => {
+    const fetchMock = vi.fn(async () => json(200, ALLOW));
+    const guard = client(fetchMock, { principal: undefined });
+    await expect(guard.check(ACTION)).resolves.toMatchObject(deny('client_error'));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('GuardClient.get / waitFor', () => {
+  it('get 发送 GET /decisions/{id}；404 → DENY http_404', async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 404 }));
+    const d = await client(fetchMock).get('d/1');
+    const req = request(fetchMock);
+    expect(req.url).toBe('https://guard.example/api/v1/guard/decisions/d%2F1');
+    expect(req.method).toBe('GET');
+    expect(req.headers.get('Authorization')).toBe('Bearer ak_test');
+    expect(d).toMatchObject(deny('http_404'));
+  });
+
+  it('waitFor：PENDING、PENDING、ALLOW → ALLOW，共调用 3 次', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, PENDING))
+      .mockResolvedValueOnce(json(200, PENDING))
+      .mockResolvedValueOnce(json(200, { ...PENDING, effectiveOutcome: 'ALLOW' }));
+    const sleep = vi.fn(async () => undefined);
+    const d = await client(fetchMock, { sleep }).waitFor('d-1', { intervalMs: 500 });
+
+    expect(d.effectiveOutcome).toBe('ALLOW');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(request(fetchMock, 2).url).toBe('https://guard.example/api/v1/guard/decisions/d-1');
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(500);
+  });
+
+  it('waitFor 超时 → DENY wait_timeout，保留真实 decisionId', async () => {
+    let clock = 0;
+    const fetchMock = vi.fn(async () => json(200, PENDING));
+    const sleep = vi.fn(async (ms: number) => {
+      clock += ms;
+    });
+    const d = await client(fetchMock, { sleep, now: () => clock }).waitFor('d-1', {
+      timeoutMs: 5000,
+      intervalMs: 2000,
+    });
+
+    expect(d).toMatchObject(deny('wait_timeout', 'd-1'));
+    // t=0、2000、4000、5000 各轮询一次：最后一次睡眠只睡到截止时刻。
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([2000, 2000, 1000]);
+  });
+
+  it('waitFor 轮询中途出错 → 直接返回该 DENY（fail-closed）', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, PENDING))
+      .mockRejectedValueOnce(new TypeError('fetch failed'));
+    const d = await client(fetchMock, { sleep: async () => undefined }).waitFor('d-1');
+    expect(d).toMatchObject(deny('client_error'));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('GuardClient 审批', () => {
+  const APPROVED: GuardDecision = {
+    ...PENDING,
+    approval: { ...PENDING.approval!, status: 'APPROVED' },
+    effectiveOutcome: 'ALLOW',
+  };
+
+  it('listApprovals 发送 status/page/size 查询参数并返回分页', async () => {
+    const page = {
+      items: [
+        {
+          createdAt: '2026-10-07T05:12:00Z',
+          decisionId: 'd-1',
+          expiresAt: '2026-10-08T05:12:00Z',
+          id: 'a-1',
+          outcome: 'REQUIRE_APPROVAL',
+          principalId: 'agent-7',
+          requiredRole: 'DPO',
+          status: 'PENDING',
+        },
+      ],
+      page: 1,
+      size: 5,
+    };
+    const fetchMock = vi.fn(async () => json(200, page));
+    const r = await client(fetchMock).listApprovals('PENDING', 1, 5);
+
+    const req = request(fetchMock);
+    expect(req.method).toBe('GET');
+    expect(req.url).toBe('https://guard.example/api/v1/guard/approvals?status=PENDING&page=1&size=5');
+    expect(r).toEqual({ ok: true, ...page });
+  });
+
+  it('listApprovals 默认 PENDING / 0 / 20；400 → { ok:false, error }', async () => {
+    const fetchMock = vi.fn(async () => json(400, { error: 'invalid_status', message: 'bad status' }));
+    const r = await client(fetchMock).listApprovals();
+    expect(request(fetchMock).url).toBe('https://guard.example/api/v1/guard/approvals?status=PENDING&page=0&size=20');
+    expect(r).toEqual({ ok: false, status: 400, error: 'invalid_status', message: 'bad status' });
+  });
+
+  it('approve 携带 X-User-Business-Role 与 comment，返回 { ok:true, decision }', async () => {
+    const fetchMock = vi.fn(async () => json(200, APPROVED));
+    const r = await client(fetchMock).approve('a-1', { comment: 'ok', businessRole: 'DPO' });
+
+    const req = request(fetchMock);
+    expect(req.url).toBe('https://guard.example/api/v1/guard/approvals/a-1/approve');
+    expect(req.method).toBe('POST');
+    expect(req.headers.get('X-User-Business-Role')).toBe('DPO');
+    expect(req.headers.get('Authorization')).toBe('Bearer ak_test');
+    expect(req.body).toEqual({ comment: 'ok' });
+    expect(r).toEqual({ ok: true, decision: APPROVED });
+  });
+
+  it('approve 不带参数时发送空对象且不带业务角色头', async () => {
+    const fetchMock = vi.fn(async () => json(200, APPROVED));
+    await client(fetchMock).approve('a-1');
+    const req = request(fetchMock);
+    expect(req.body).toEqual({});
+    expect(req.headers.has('X-User-Business-Role')).toBe(false);
+  });
+
+  it('approve 403 → { ok:false, status:403, error:segregation_of_duties }', async () => {
+    const fetchMock = vi.fn(async () =>
+      json(403, { error: 'segregation_of_duties', message: '审批人不能是发起主体' }),
+    );
+    await expect(client(fetchMock).approve('a-1')).resolves.toEqual({
+      ok: false,
+      status: 403,
+      error: 'segregation_of_duties',
+      message: '审批人不能是发起主体',
+    });
+  });
+
+  it('approve 网络错误 → { ok:false, status:0, error:client_error }，不抛异常', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    });
+    await expect(client(fetchMock).approve('a-1')).resolves.toEqual({
+      ok: false,
+      status: 0,
+      error: 'client_error',
+      message: 'fetch failed',
+    });
+  });
+
+  it('reject 发送 comment 到 /reject', async () => {
+    const rejected = { ...APPROVED, effectiveOutcome: 'DENY' as const };
+    const fetchMock = vi.fn(async () => json(200, rejected));
+    const r = await client(fetchMock).reject('a-1', { comment: '证据不足' });
+    const req = request(fetchMock);
+    expect(req.url).toBe('https://guard.example/api/v1/guard/approvals/a-1/reject');
+    expect(req.body).toEqual({ comment: '证据不足' });
+    expect(r).toEqual({ ok: true, decision: rejected });
+  });
+
+  it('reject 无 comment（或空白）在客户端拒绝，不调用 fetch', async () => {
+    const fetchMock = vi.fn(async () => json(200, APPROVED));
+    const guard = client(fetchMock);
+    for (const comment of [undefined, '', '   ']) {
+      const r = await guard.reject('a-1', { comment } as { comment: string });
+      expect(r).toMatchObject({ ok: false, error: 'comment_required' });
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

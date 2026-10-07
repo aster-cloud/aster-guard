@@ -1,0 +1,164 @@
+// GuardClient 的公开类型：与 aster-api `/api/v1/guard/*` 的请求 / 响应同形（ADR 0040 §2.2、§3.1、§4.2）。
+
+/** Agent 唯一需要看的结论：ALLOW 执行；DENY 不执行；PENDING 等待审批（轮询或 waitFor）。 */
+export type GuardEffectiveOutcome = 'ALLOW' | 'DENY' | 'PENDING';
+
+/** 规则给出的原始结论（Verdict outcome）。 */
+export type GuardOutcome = 'ALLOW' | 'DENY' | 'REQUIRE_APPROVAL' | 'ESCALATE';
+
+/** 待审批记录的状态。 */
+export type GuardApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED';
+
+/** 发起主体：id 必填；type 缺省由服务端按 "agent" 处理。 */
+export interface GuardPrincipal {
+  id: string;
+  type?: string;
+  roles?: string[];
+}
+
+/** 提议动作：谁（principal）对什么（resource）做什么（action），即决策请求体中的 `action`。 */
+export interface GuardAction {
+  principal: GuardPrincipal;
+  action: { name: string };
+  resource?: { type?: string; id?: string };
+  context?: Record<string, unknown>;
+  agent?: { model?: string; session?: string };
+}
+
+/** `check` 的入参：principal 可省略，缺省取 {@link GuardClientOptions.principal}。 */
+export type GuardActionInput = Omit<GuardAction, 'principal'> & { principal?: GuardPrincipal };
+
+/** 决策上的待审批视图；requiredRole 缺省表示任意复核人（ESCALATE）。 */
+export interface GuardDecisionApproval {
+  expiresAt: string;
+  id: string;
+  requiredRole?: string;
+  status: GuardApprovalStatus;
+}
+
+/** 被评估的活跃策略版本。 */
+export interface GuardPolicyVersion {
+  id: number;
+  sourceHash: string;
+  version: number;
+}
+
+/** 决策收据：审计哈希链中的行 id、本行哈希与前一行哈希（链首行没有 prevHash）。 */
+export interface GuardReceipt {
+  auditId: number;
+  hash: string;
+  prevHash?: string;
+}
+
+/**
+ * 决策（与 aster-api `GuardDecisionResponse` 同形，服务端省略 null / 空字段）。
+ *
+ * 客户端 fail-closed 产生的 DENY 只有 decisionId（无法取得时为空串）、outcome、effectiveOutcome、
+ * reasonCode、reason。客户端 reasonCode：`http_<status>`、`idempotency_mismatch`、`client_error`、
+ * `client_timeout`、`wait_timeout`；服务端 reasonCode 另有 `not_a_verdict`、`evaluation_failed`、
+ * `receipt_unavailable` 等（§3.2）。
+ */
+export interface GuardDecision {
+  approval?: GuardDecisionApproval;
+  controls?: string[];
+  decisionId: string;
+  effectiveOutcome: GuardEffectiveOutcome;
+  outcome: GuardOutcome;
+  policyVersion?: GuardPolicyVersion;
+  reason?: string;
+  reasonCode?: string;
+  receipt?: GuardReceipt;
+  role?: string;
+  ruleId?: string;
+}
+
+/** 审批列表项（aster-api `ApprovalItemView`，时间为 ISO-8601 字符串，null 字段省略）。 */
+export interface GuardApproval {
+  comment?: string;
+  createdAt: string;
+  decidedAt?: string;
+  decidedBy?: string;
+  decisionId: string;
+  expiresAt: string;
+  id: string;
+  outcome: Extract<GuardOutcome, 'REQUIRE_APPROVAL' | 'ESCALATE'>;
+  principalId: string;
+  requiredRole?: string;
+  status: GuardApprovalStatus;
+}
+
+/** 审批列表的一页；page 从 0 起，size 为服务端夹取后的实际值（1–200）。 */
+export interface GuardApprovalPage {
+  items: GuardApproval[];
+  page: number;
+  size: number;
+}
+
+/**
+ * 审批类操作的失败结果。审批不是 guard 结论，调用方需要错误码来区分处理，因此不做 fail-closed 映射。
+ *
+ * status 为 HTTP 状态码；未发出请求或未收到 HTTP 响应时为 0。error 为服务端错误码
+ * （如 `segregation_of_duties`），或客户端错误码 `client_error` / `client_timeout` / `comment_required`，
+ * 服务端未给出错误码时为 `http_<status>`。
+ */
+export interface GuardApiError {
+  ok: false;
+  status: number;
+  error: string;
+  message: string;
+}
+
+/** approve / reject 的结果：成功时为迁移后的决策（批准 → ALLOW，拒绝 → DENY）。 */
+export type GuardApprovalResult = { ok: true; decision: GuardDecision } | GuardApiError;
+
+/** listApprovals 的结果。 */
+export type GuardApprovalListResult = ({ ok: true } & GuardApprovalPage) | GuardApiError;
+
+/** `check` 的选项。 */
+export interface GuardCheckOptions {
+  /** 本次动作尝试的幂等键；省略时自动生成 UUID。只应在同一次尝试的网络重试之间复用（§6）。 */
+  idempotencyKey?: string;
+  /** PENDING 时服务端最多等待的秒数（服务端夹到 0–30）；客户端超时会相应延长。 */
+  waitSeconds?: number;
+}
+
+/** `waitFor` 的选项。 */
+export interface GuardWaitOptions {
+  /** 总等待时长，默认 300000 ms。 */
+  timeoutMs?: number;
+  /** 轮询间隔，默认 2000 ms。 */
+  intervalMs?: number;
+}
+
+/** `approve` 的选项。 */
+export interface GuardApproveOptions {
+  comment?: string;
+  /** 审批人的业务角色，作为 `X-User-Business-Role` 头发送，与规则的 required role 精确比对。 */
+  businessRole?: string;
+}
+
+/** `reject` 的选项：comment 必填。 */
+export interface GuardRejectOptions {
+  comment: string;
+  businessRole?: string;
+}
+
+/** GuardClient 配置。baseUrl、apiKey、policyModule、policyFunction 缺失属于编程错误，构造时抛出。 */
+export interface GuardClientOptions {
+  /** aster-api 根地址，如 `https://api.example.com`（末尾斜杠可有可无）。 */
+  baseUrl: string;
+  /** API key，作为 `Authorization: Bearer <apiKey>` 发送。 */
+  apiKey: string;
+  policyModule: string;
+  policyFunction: string;
+  /** 默认发起主体；`check` 的 action 未带 principal 时使用。 */
+  principal?: GuardPrincipal;
+  /** 可注入的 fetch 实现，默认 `globalThis.fetch`。 */
+  fetch?: typeof fetch;
+  /** 单次请求超时，默认 10000 ms；超时后中止请求并按 `client_timeout` 处理。 */
+  timeoutMs?: number;
+  /** waitFor 使用的睡眠函数，供测试注入。 */
+  sleep?: (ms: number) => Promise<void>;
+  /** waitFor 使用的时钟（毫秒），供测试注入，默认 `Date.now`。 */
+  now?: () => number;
+}

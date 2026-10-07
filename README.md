@@ -33,9 +33,9 @@ Authorization: Bearer ak_…
 
 API key 同时决定租户、计量与配额。审批的「四眼」规则也会比对提交决策所用的 API key：提交某个动作的 key 不能批准同一动作（见 ADR 0040 §4.2）。
 
-## GuardClient（实现于后续任务）
+## GuardClient
 
-用法草图，方法名与 ADR 0040 §6 一致：
+用法（ADR 0040 §6）：
 
 ```ts
 import { GuardClient } from '@aster-cloud/aster-guard';
@@ -49,7 +49,7 @@ const guard = new GuardClient({
 });
 
 const decision = await guard.check({
-  name: 'delete_customer_record',
+  action: { name: 'delete_customer_record' },
   resource: { type: 'customer', id: 'C-1001' },
   context: { amount: 250000, currency: 'NZD' },
 });
@@ -69,18 +69,20 @@ switch (decision.effectiveOutcome) {
 }
 ```
 
-计划提供的方法：
+方法：
 
 | 方法 | 说明 |
 |---|---|
-| `check(action, opts)` | `POST /api/v1/guard/decisions`，返回 `Decision` |
+| `check(action, { idempotencyKey?, waitSeconds? })` | `POST /api/v1/guard/decisions`，返回 `GuardDecision`；`action.principal` 缺省取配置；未给 `idempotencyKey` 时每次调用生成新的 UUID |
 | `get(decisionId)` | `GET /api/v1/guard/decisions/{id}`，读取当前状态 |
-| `waitFor(decisionId, { timeoutMs, intervalMs })` | 轮询直到不再 PENDING 或超时 |
-| `listApprovals()` | `GET /api/v1/guard/approvals`，列出待审批 |
-| `approve(id, comment?)` | `POST /api/v1/guard/approvals/{id}/approve` |
-| `reject(id, comment)` | `POST /api/v1/guard/approvals/{id}/reject`，`comment` 必填 |
+| `waitFor(decisionId, { timeoutMs = 300000, intervalMs = 2000 })` | 轮询直到不再 PENDING；到时仍为 PENDING 返回 DENY `wait_timeout`（保留 decisionId） |
+| `listApprovals(status = 'PENDING', page = 0, size = 20)` | `GET /api/v1/guard/approvals`，返回 `{ ok: true, items, page, size }` 或 `{ ok: false, … }` |
+| `approve(id, { comment?, businessRole? })` | `POST /api/v1/guard/approvals/{id}/approve`；`businessRole` 作为 `X-User-Business-Role` 头发送 |
+| `reject(id, { comment, businessRole? })` | `POST /api/v1/guard/approvals/{id}/reject`；`comment` 必填，缺失时客户端直接返回 `comment_required` |
 
 `effectiveOutcome` 是调用方唯一需要看的字段：`ALLOW` 才可执行；`DENY` 不执行；`PENDING` 继续轮询。
+
+`check` / `get` / `waitFor` 从不抛异常。客户端无法确认结论时返回 `decisionId: ''`、`effectiveOutcome: 'DENY'` 的决策，`reasonCode` 为：`http_<status>`（非 2xx）、`idempotency_mismatch`（422）、`client_error`（网络错误、响应体不合契约）、`client_timeout`（单次请求超时，默认 10 秒，`timeoutMs` 可配；带 `waitSeconds` 时自动延长）。审批操作不是 guard 结论，失败时返回 `{ ok: false, status, error, message }`，`error` 为服务端错误码（如 `segregation_of_duties`）；未收到 HTTP 响应时 `status` 为 0。
 
 ## aster-guard-mcp（实现于后续任务）
 

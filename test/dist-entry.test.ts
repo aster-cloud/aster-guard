@@ -7,4 +7,9 @@ describe('包入口（dist 产物）', () => {
     const entry = await import('../dist/index.js');
     expect(entry.VERSION).toBe('0.1.0');
   });
+
+  it('dist/index.js 导出 GuardClient', async () => {
+    const entry = await import('../dist/index.js');
+    expect(typeof entry.GuardClient).toBe('function');
+  });
 });
