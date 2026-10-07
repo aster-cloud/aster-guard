@@ -11,7 +11,7 @@ AI Agent 在执行有副作用的动作之前（删除客户记录、转账、�
 
 设计依据见 aster-api 仓库 `docs/adr/0040-action-guard.md`（ADR 0040：Action Guard，本包对应 §6），随子项目 2 合并后可见。
 
-> **当前状态：脚手架（0.1.0）。** 仓库、工具链与 CI/发布流程已就绪，`src/index.ts` 目前只导出 `VERSION`。下文标注「实现于后续任务」的章节描述的是设计目标，尚不可用。
+> **当前状态：0.1.0，尚未发布。** `GuardClient` 与 `aster-guard-mcp` 均已实现。
 
 ## 安装
 
@@ -84,17 +84,43 @@ switch (decision.effectiveOutcome) {
 
 `check` / `get` / `waitFor` 从不抛异常。客户端无法确认结论时返回 `decisionId: ''`、`effectiveOutcome: 'DENY'` 的决策，`reasonCode` 为：`http_<status>`（非 2xx）、`idempotency_mismatch`（422）、`client_error`（网络错误、响应体不合契约）、`client_timeout`（单次请求超时，默认 12 秒，为服务端 10 秒评估超时留出余量，`timeoutMs` 可配；带 `waitSeconds` 时自动延长）。审批操作不是 guard 结论，失败时返回 `{ ok: false, status, error, message }`，`error` 为服务端错误码（如 `segregation_of_duties`）；未收到 HTTP 响应时 `status` 为 0。
 
-## aster-guard-mcp（实现于后续任务）
+## aster-guard-mcp
 
-stdio MCP 代理。连接一个上游 MCP 服务器，原样转发 `tools/list`，并拦截每一次 `tools/call`：
+stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 MCP 服务器：原样转发 `tools/list`，并拦截每一次 `tools/call`：
 
-1. 构造 Action：`action.name` 为工具名，`context` 为工具参数，`resource` 可由 `--resource-from <jsonpath>` 规则抽取，`principal` 来自配置。
-2. 调用 `GuardClient.check`。
-3. `ALLOW` 转发给上游；`DENY` 返回 MCP 工具错误（含 reason 与 decisionId）；`PENDING` 等待审批，最长 `--approval-timeout`（默认 300 秒），再按最终结果转发或拒绝。
+1. 构造 Action：`action.name` 为工具名，`context` 为工具参数，`principal` 来自配置；指定 `--resource-from <argName>` 时，取该参数的值作为 `resource: { type: 'arg', id }`；`--agent-model` 写入 `agent.model`。
+2. 以新的 UUID 作幂等键调用 `GuardClient.check`（每次调用一个新键，不从 JSON-RPC 请求 id 派生）。
+3. 只有服务端确认的 `ALLOW` 才转发给上游，上游结果原样返回；`DENY` 返回工具错误 `Blocked by Aster Guard: <reason> (decision <id>)`，guard 不可达时 decision 为 `n/a`；`PENDING` 则等待审批，最长 `--approval-timeout` 秒（默认 300），再按最终结论转发或拒绝。等待期间下游取消请求的，审批随后通过也不再转发。
+4. 上游没有的工具名返回 MCP 协议错误，不发起裁决。
 
-不指定上游时，代理只暴露 `guard_check` / `guard_status` / `guard_list_approvals` / `guard_approve` / `guard_reject` 五个工具，供人机协作场景使用。
+不指定上游时，只提供五个治理工具，供人机协作场景使用。结果是 JSON 文本，`DENY` 或 `ok: false` 时标记 `isError`：
 
-Claude Desktop 配置示例（`claude_desktop_config.json`）。参数与环境变量名为设计草图，以实现任务落地后的 `--help` 为准：
+| 工具 | 对应方法 | 参数 |
+|---|---|---|
+| `guard_check` | `check` | `action: { name }`、`resource?`、`context?`、`waitSeconds?`（主体与模型来自配置，参数不能改写） |
+| `guard_status` | `get` | `decisionId` |
+| `guard_list_approvals` | `listApprovals` | `status?`、`page?`、`size?` |
+| `guard_approve` | `approve` | `approvalId`、`comment?`、`businessRole?` |
+| `guard_reject` | `reject` | `approvalId`、`comment`（必填）、`businessRole?` |
+
+命令行参数（完整说明见 `aster-guard-mcp --help`）：
+
+| 参数 | 说明 |
+|---|---|
+| `--base-url <url>` | 必填，aster-api 根地址 |
+| `--policy <module>/<function>` | 必填，裁决所用的策略，如 `guard.customer/decide` |
+| `--principal-id <id>` | 必填，发起主体 id |
+| `--upstream "<cmd> [args…]"` | 上游 MCP 服务器的启动命令，按 shell 规则切分（支持引号）；省略则为治理工具模式 |
+| `--api-key-env <name>` | 存放 API key 的环境变量名，默认 `ASTER_GUARD_API_KEY`；API key 只从环境变量读取 |
+| `--principal-type <type>` | 默认 `agent` |
+| `--principal-roles <a,b>` | 逗号分隔 |
+| `--approval-timeout <seconds>` | 默认 300 |
+| `--resource-from <argName>` | 以该工具参数的值作为 `resource.id` |
+| `--agent-model <model>` | 写入 `action.agent.model` |
+
+上游子进程继承代理的环境变量，但不包含 API key 所在的那个变量。stdout 是 MCP 通道，日志一律写 stderr。退出码：`0` 正常结束（含 `--help`），`1` 上游无法启动或意外断开，`2` 参数错误。
+
+Claude Desktop 配置示例（`claude_desktop_config.json`）：
 
 ```json
 {
@@ -106,11 +132,16 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）。参数与环境�
         "@aster-cloud/aster-guard",
         "--upstream",
         "npx -y @modelcontextprotocol/server-filesystem /Users/me/work",
-        "--approval-timeout",
-        "300"
+        "--base-url",
+        "https://api.aster-lang.cloud",
+        "--policy",
+        "guard.customer/decide",
+        "--principal-id",
+        "agent-42",
+        "--resource-from",
+        "path"
       ],
       "env": {
-        "ASTER_GUARD_BASE_URL": "https://api.aster-lang.cloud",
         "ASTER_GUARD_API_KEY": "ak_xxxxxxxx"
       }
     }
@@ -118,9 +149,9 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）。参数与环境�
 }
 ```
 
-> 包只有一个可执行文件 `aster-guard-mcp`，`npx` 会直接运行它；全局安装后也可把 `command` 写成 `aster-guard-mcp`。`policyModule`、`policyFunction` 与 `principal` 同样由配置提供，不在示例中展开。
+> 包只有一个可执行文件 `aster-guard-mcp`，`npx` 会直接运行它，包名之后不要再写 `aster-guard-mcp`（会被当作多余的位置参数而报错）；全局安装后也可把 `command` 写成 `aster-guard-mcp`。
 
-## fail-closed 语义（设计约束，随实现任务落地）
+## fail-closed 语义
 
 守门失效不能等于放行。客户端与代理遵守同一条规则：
 
@@ -131,7 +162,7 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）。参数与环境�
 
 这些是安全属性，不是可调参数：任何改动都不得把「无法确认」解释为放行。
 
-## 幂等键策略（设计约束，随实现任务落地）
+## 幂等键策略
 
 `POST /api/v1/guard/decisions` 通过 `Idempotency-Key` 头去重。SDK 与代理统一遵守：
 
