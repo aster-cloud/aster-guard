@@ -75,14 +75,14 @@ switch (decision.effectiveOutcome) {
 |---|---|
 | `check(action, { idempotencyKey?, waitSeconds? })` | `POST /api/v1/guard/decisions`，返回 `GuardDecision`；`action.principal` 缺省取配置；未给 `idempotencyKey` 时每次调用生成新的 UUID |
 | `get(decisionId)` | `GET /api/v1/guard/decisions/{id}`，读取当前状态 |
-| `waitFor(decisionId, { timeoutMs = 300000, intervalMs = 2000 })` | 轮询直到不再 PENDING；到时仍为 PENDING 返回 DENY `wait_timeout`（保留 decisionId） |
+| `waitFor(decisionId, { timeoutMs = 300000, intervalMs = 2000 })` | 轮询直到服务端给出非 PENDING 结论；瞬时失败（网络、超时、5xx、429）继续轮询，其他失败立即返回 DENY；到时返回 DENY `wait_timeout`。两者都保留 decisionId |
 | `listApprovals(status = 'PENDING', page = 0, size = 20)` | `GET /api/v1/guard/approvals`，返回 `{ ok: true, items, page, size }` 或 `{ ok: false, … }` |
 | `approve(id, { comment?, businessRole? })` | `POST /api/v1/guard/approvals/{id}/approve`；`businessRole` 作为 `X-User-Business-Role` 头发送 |
 | `reject(id, { comment, businessRole? })` | `POST /api/v1/guard/approvals/{id}/reject`；`comment` 必填，缺失时客户端直接返回 `comment_required` |
 
 `effectiveOutcome` 是调用方唯一需要看的字段：`ALLOW` 才可执行；`DENY` 不执行；`PENDING` 继续轮询。
 
-`check` / `get` / `waitFor` 从不抛异常。客户端无法确认结论时返回 `decisionId: ''`、`effectiveOutcome: 'DENY'` 的决策，`reasonCode` 为：`http_<status>`（非 2xx）、`idempotency_mismatch`（422）、`client_error`（网络错误、响应体不合契约）、`client_timeout`（单次请求超时，默认 10 秒，`timeoutMs` 可配；带 `waitSeconds` 时自动延长）。审批操作不是 guard 结论，失败时返回 `{ ok: false, status, error, message }`，`error` 为服务端错误码（如 `segregation_of_duties`）；未收到 HTTP 响应时 `status` 为 0。
+`check` / `get` / `waitFor` 从不抛异常。客户端无法确认结论时返回 `decisionId: ''`、`effectiveOutcome: 'DENY'` 的决策，`reasonCode` 为：`http_<status>`（非 2xx）、`idempotency_mismatch`（422）、`client_error`（网络错误、响应体不合契约）、`client_timeout`（单次请求超时，默认 12 秒，为服务端 10 秒评估超时留出余量，`timeoutMs` 可配；带 `waitSeconds` 时自动延长）。审批操作不是 guard 结论，失败时返回 `{ ok: false, status, error, message }`，`error` 为服务端错误码（如 `segregation_of_duties`）；未收到 HTTP 响应时 `status` 为 0。
 
 ## aster-guard-mcp（实现于后续任务）
 

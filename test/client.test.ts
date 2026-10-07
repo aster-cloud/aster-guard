@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GuardClient, type GuardClientOptions, type GuardDecision } from '../src/index.js';
 
 // 单元测试：注入 vi.fn() 作为 fetch，不发真实网络请求（ADR 0040 §6）。
@@ -164,11 +164,34 @@ describe('GuardClient.check', () => {
     const d = await client(fetchMock, { timeoutMs: 20 }).check(ACTION);
     expect(d).toMatchObject(deny('client_timeout'));
     expect(request(fetchMock).headers.get('Idempotency-Key')).toBeTruthy();
+    expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
   });
 
-  it('fetch 忽略 AbortSignal 永不返回时同样按时 DENY client_timeout', async () => {
-    const fetchMock = vi.fn(() => new Promise<Response>(() => undefined));
+  it('fetch 忽略 AbortSignal 永不返回时同样按时 DENY client_timeout，且仍中止请求', async () => {
+    const fetchMock = vi.fn<typeof fetch>(() => new Promise<Response>(() => undefined));
     await expect(client(fetchMock, { timeoutMs: 20 }).check(ACTION)).resolves.toMatchObject(deny('client_timeout'));
+    expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
+  });
+
+  describe('默认超时', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('默认单次超时为 12000 ms（服务端评估超时 10 秒另留余量）', async () => {
+      vi.useFakeTimers();
+      const fetchMock = vi.fn<typeof fetch>(() => new Promise<Response>(() => undefined));
+      let result: GuardDecision | undefined;
+      void client(fetchMock).check(ACTION).then((d) => {
+        result = d;
+      });
+
+      await vi.advanceTimersByTimeAsync(11_999);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(result).toMatchObject(deny('client_timeout'));
+      expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
+    });
   });
 
   it('waitSeconds 让服务端等待时，客户端超时相应延长', async () => {
@@ -230,14 +253,85 @@ describe('GuardClient.get / waitFor', () => {
     expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([2000, 2000, 1000]);
   });
 
-  it('waitFor 轮询中途出错 → 直接返回该 DENY（fail-closed）', async () => {
+  it('waitFor 容忍瞬时错误：PENDING → 网络错误 → 503 → ALLOW 得到 ALLOW，共 4 次轮询', async () => {
+    const allow = { ...PENDING, effectiveOutcome: 'ALLOW' };
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(json(200, PENDING))
-      .mockRejectedValueOnce(new TypeError('fetch failed'));
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce(new Response('unavailable', { status: 503 }))
+      .mockResolvedValueOnce(json(200, allow));
     const d = await client(fetchMock, { sleep: async () => undefined }).waitFor('d-1');
-    expect(d).toMatchObject(deny('client_error'));
+    expect(d).toEqual(allow);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([429, 502])('waitFor 把 %i 视为瞬时错误，继续轮询', async (status) => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(json(status, { error: 'busy', message: 'try later' }))
+      .mockResolvedValueOnce(json(200, ALLOW));
+    const d = await client(fetchMock, { sleep: async () => undefined }).waitFor('d-1');
+    expect(d).toEqual(ALLOW);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([400, 401, 403, 404])('waitFor 中途 %i（非瞬时）立即返回 DENY http_<status>，保留 decisionId', async (status) => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, PENDING))
+      .mockResolvedValueOnce(new Response(null, { status }));
+    const d = await client(fetchMock, { sleep: async () => undefined }).waitFor('d-1');
+    expect(d).toMatchObject(deny(`http_${status}`, 'd-1'));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('waitFor 收到不合契约的 2xx 立即返回 DENY client_error，保留 decisionId', async () => {
+    const fetchMock = vi.fn(async () => json(200, { decisionId: 'd-1', outcome: 'ALLOW', effectiveOutcome: 'MAYBE' }));
+    const d = await client(fetchMock, { sleep: async () => undefined }).waitFor('d-1');
+    expect(d).toMatchObject(deny('client_error', 'd-1'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('waitFor 持续 503 到截止时刻 → DENY wait_timeout，保留 decisionId，reason 提及 503', async () => {
+    let clock = 0;
+    const fetchMock = vi.fn(async () => new Response('unavailable', { status: 503 }));
+    const sleep = async (ms: number) => {
+      clock += ms;
+    };
+    const d = await client(fetchMock, { sleep, now: () => clock }).waitFor('d-1', {
+      timeoutMs: 5000,
+      intervalMs: 2000,
+    });
+    expect(d).toMatchObject(deny('wait_timeout', 'd-1'));
+    expect(d.reason).toContain('503');
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    { timeoutMs: Number.NaN },
+    { timeoutMs: -1 },
+    { timeoutMs: Number.NEGATIVE_INFINITY },
+    { intervalMs: Number.NaN },
+    { intervalMs: 0 },
+    { intervalMs: -5 },
+    { intervalMs: Number.POSITIVE_INFINITY },
+  ])('waitFor 选项非法 %o → 抛 TypeError，不发请求', async (opts) => {
+    const fetchMock = vi.fn(async () => json(200, ALLOW));
+    await expect(client(fetchMock).waitFor('d-1', opts)).rejects.toThrow(TypeError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('waitFor timeoutMs=0 只轮询一次；timeoutMs=Infinity 合法', async () => {
+    const pending = vi.fn(async () => json(200, PENDING));
+    await expect(client(pending).waitFor('d-1', { timeoutMs: 0 })).resolves.toMatchObject(deny('wait_timeout', 'd-1'));
+    expect(pending).toHaveBeenCalledTimes(1);
+
+    const fetchMock = vi.fn().mockResolvedValueOnce(json(200, PENDING)).mockResolvedValueOnce(json(200, ALLOW));
+    const d = await client(fetchMock, { sleep: async () => undefined }).waitFor('d-1', {
+      timeoutMs: Number.POSITIVE_INFINITY,
+    });
+    expect(d).toEqual(ALLOW);
   });
 });
 

@@ -14,7 +14,8 @@ import type {
   GuardWaitOptions,
 } from './types.js';
 
-const DEFAULT_TIMEOUT_MS = 10_000;
+/** 服务端评估超时为 10 秒（§3.2），客户端多留 2 秒余量，避免把「慢但成功」的 ALLOW 报成 DENY。 */
+const DEFAULT_TIMEOUT_MS = 12_000;
 const DEFAULT_WAIT_TIMEOUT_MS = 300_000;
 const DEFAULT_WAIT_INTERVAL_MS = 2_000;
 /** 服务端对 waitSeconds 的上限（ADR 0040 §3.1）；客户端超时按此上限延长，避免先于服务端放弃。 */
@@ -30,6 +31,9 @@ const EFFECTIVE_OUTCOMES = new Set<unknown>(['ALLOW', 'DENY', 'PENDING']);
 type Exchange =
   | { kind: 'response'; status: number; body: unknown }
   | { kind: 'failure'; error: 'client_error' | 'client_timeout'; message: string };
+
+/** 合乎契约的 2xx 响应体，或 GuardApiError。 */
+type Checked<T> = { ok: true; body: T } | GuardApiError;
 
 interface ExchangeRequest {
   body?: unknown;
@@ -93,29 +97,33 @@ export class GuardClient {
       headers: { 'Idempotency-Key': idempotencyKey },
       timeoutMs: this.timeoutMs + serverWaitMs(waitSeconds),
     });
-    return toDecision(exchange);
+    return toDecision(interpret(exchange, isDecision));
   }
 
   /** 读取决策的当前状态（approval.status 与 effectiveOutcome 反映审批进展）。 */
   async get(decisionId: string): Promise<GuardDecision> {
-    return toDecision(await this.exchange('GET', `${DECISIONS_PATH}/${encodeURIComponent(decisionId)}`));
+    return toDecision(await this.readDecision(decisionId));
   }
 
   /**
-   * 轮询直到决策不再 PENDING。到时仍为 PENDING 时返回 DENY `wait_timeout`（保留真实 decisionId，便于之后再查）。
-   * 轮询中任何一次读取失败都会得到 DENY，按 fail-closed 直接返回。最后一次睡眠只睡到截止时刻，
-   * 实际耗时可能再多出一次请求的超时。
+   * 轮询直到服务端给出非 PENDING 的结论。只有服务端确认的 ALLOW 才会返回 ALLOW。
+   *
+   * - 瞬时失败（未收到响应、5xx、429）不结束等待，继续轮询到截止时刻；
+   * - 其他失败（400 / 401 / 403 / 404、不合契约的 2xx 等）立即返回对应 DENY，decisionId 保留为被等待的 id；
+   * - 到时仍未得到结论返回 DENY `wait_timeout`（保留 decisionId），reason 说明最后一次轮询的情况。
+   *
+   * 最后一次睡眠只睡到截止时刻，实际耗时可能再多出一次请求的超时。选项非法属于编程错误，抛 TypeError。
    */
   async waitFor(decisionId: string, opts: GuardWaitOptions = {}): Promise<GuardDecision> {
     const { timeoutMs = DEFAULT_WAIT_TIMEOUT_MS, intervalMs = DEFAULT_WAIT_INTERVAL_MS } = opts;
+    requireWaitOptions(timeoutMs, intervalMs);
     const deadline = this.now() + timeoutMs;
     for (;;) {
-      const decision = await this.get(decisionId);
-      if (decision.effectiveOutcome !== 'PENDING') return decision;
+      const result = await this.readDecision(decisionId);
+      if (result.ok && result.body.effectiveOutcome !== 'PENDING') return result.body;
+      if (!result.ok && !isTransient(result)) return { ...denyOf(result), decisionId };
       const remainingMs = deadline - this.now();
-      if (remainingMs <= 0) {
-        return { ...clientDeny('wait_timeout', `等待 ${timeoutMs} ms 后决策仍为 PENDING`), decisionId };
-      }
+      if (remainingMs <= 0) return waitTimeout(decisionId, timeoutMs, result);
       await this.sleep(Math.min(intervalMs, remainingMs));
     }
   }
@@ -139,6 +147,10 @@ export class GuardClient {
       return { ok: false, status: 0, error: 'comment_required', message: '拒绝必须填写 comment' };
     }
     return this.decideApproval(approvalId, 'reject', comment, businessRole);
+  }
+
+  private async readDecision(decisionId: string): Promise<Checked<GuardDecision>> {
+    return interpret(await this.exchange('GET', `${DECISIONS_PATH}/${encodeURIComponent(decisionId)}`), isDecision);
   }
 
   private async decideApproval(
@@ -205,7 +217,7 @@ export class GuardClient {
 }
 
 /** 把一次往返解释为「合乎契约的 2xx 响应体」或 GuardApiError。 */
-function interpret<T>(exchange: Exchange, isValid: (body: unknown) => body is T): { ok: true; body: T } | GuardApiError {
+function interpret<T>(exchange: Exchange, isValid: (body: unknown) => body is T): Checked<T> {
   if (exchange.kind === 'failure') {
     return { ok: false, status: 0, error: exchange.error, message: exchange.message };
   }
@@ -226,9 +238,23 @@ function interpret<T>(exchange: Exchange, isValid: (body: unknown) => body is T)
 }
 
 /** guard 结论的 fail-closed 映射：任何失败都成为 DENY。 */
-function toDecision(exchange: Exchange): GuardDecision {
-  const result = interpret(exchange, isDecision);
-  return result.ok ? result.body : clientDeny(denyReasonCode(result), result.message);
+function toDecision(result: Checked<GuardDecision>): GuardDecision {
+  return result.ok ? result.body : denyOf(result);
+}
+
+function denyOf(error: GuardApiError): GuardDecision {
+  return clientDeny(denyReasonCode(error), error.message);
+}
+
+/** 等待中可重试的失败：未收到 HTTP 响应（status 0）、限流 429、服务端 5xx。 */
+function isTransient({ status }: GuardApiError): boolean {
+  return status === 0 || status === 429 || status >= 500;
+}
+
+/** waitFor 到时的 DENY：保留被等待的 decisionId，reason 说明最后一次轮询是 PENDING 还是失败。 */
+function waitTimeout(decisionId: string, timeoutMs: number, last: Checked<GuardDecision>): GuardDecision {
+  const lastPoll = last.ok ? '决策仍为 PENDING' : `最后一次读取失败（${denyReasonCode(last)}：${last.message}）`;
+  return { ...clientDeny('wait_timeout', `等待 ${timeoutMs} ms 未得到最终结论，${lastPoll}`), decisionId };
 }
 
 /** 客户端侧失败（status 0）与不合契约的 2xx 沿用其错误码；HTTP 错误为 http_<status>，422 为 idempotency_mismatch。 */
@@ -274,6 +300,16 @@ function parseJson(text: string): unknown {
     return JSON.parse(text);
   } catch {
     return undefined;
+  }
+}
+
+function requireWaitOptions(timeoutMs: number, intervalMs: number): void {
+  // !(x >= 0) 同时拦下 NaN 与负数；Infinity 表示不设截止时刻。
+  if (typeof timeoutMs !== 'number' || !(timeoutMs >= 0)) {
+    throw new TypeError('GuardClient.waitFor: timeoutMs 须为 ≥ 0 的数（可为 Infinity）');
+  }
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    throw new TypeError('GuardClient.waitFor: intervalMs 须为有限正数');
   }
 }
 

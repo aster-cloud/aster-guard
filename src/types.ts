@@ -124,9 +124,9 @@ export interface GuardCheckOptions {
 
 /** `waitFor` 的选项。 */
 export interface GuardWaitOptions {
-  /** 总等待时长，默认 300000 ms。 */
+  /** 总等待时长，默认 300000 ms；须 ≥ 0，Infinity 表示不设截止时刻。 */
   timeoutMs?: number;
-  /** 轮询间隔，默认 2000 ms。 */
+  /** 轮询间隔，默认 2000 ms；须为有限正数。 */
   intervalMs?: number;
 }
 
@@ -155,7 +155,10 @@ export interface GuardClientOptions {
   principal?: GuardPrincipal;
   /** 可注入的 fetch 实现，默认 `globalThis.fetch`。 */
   fetch?: typeof fetch;
-  /** 单次请求超时，默认 10000 ms；超时后中止请求并按 `client_timeout` 处理。 */
+  /**
+   * 单次请求超时，默认 12000 ms（服务端评估超时 10 秒，另留 2 秒余量）；
+   * 超时后中止请求并按 `client_timeout` 处理。
+   */
   timeoutMs?: number;
   /** waitFor 使用的睡眠函数，供测试注入。 */
   sleep?: (ms: number) => Promise<void>;
