@@ -1,0 +1,50 @@
+{
+  "name": "@aster-cloud/aster-guard",
+  "version": "0.1.0",
+  "description": "Aster Action Guard 的 TypeScript 客户端（GuardClient）与 MCP 代理（aster-guard-mcp）",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aster-cloud/aster-guard.git"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "bin": {
+    "aster-guard-mcp": "./dist/mcp/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "lint": "eslint src test",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "eslint": "^9",
+    "typescript": "^5.6",
+    "typescript-eslint": "^8",
+    "vitest": "^5"
+  },
+  "packageManager": "pnpm@10.31.0"
+}
