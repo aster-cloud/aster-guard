@@ -131,17 +131,19 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）：
       "command": "npx",
       "args": [
         "-y",
+        "-p",
         "@aster-cloud/aster-guard",
+        "aster-guard-mcp",
         "--upstream",
-        "npx -y @modelcontextprotocol/server-filesystem /Users/me/work",
+        "npx -y @modelcontextprotocol/server-filesystem /tmp",
         "--base-url",
-        "https://api.aster-lang.cloud",
+        "http://localhost:8080",
         "--policy",
         "guard.customer/decide",
         "--principal-id",
-        "agent-42",
-        "--resource-from",
-        "path"
+        "agent-claude",
+        "--approval-timeout",
+        "300"
       ],
       "env": {
         "ASTER_GUARD_API_KEY": "ak_xxxxxxxx"
@@ -151,9 +153,106 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）：
 }
 ```
 
-> 宿主超时：上例沿用 `--approval-timeout` 的缺省 300 秒，要求宿主对这个服务器的请求 / 工具调用超时不小于 300 秒；宿主超时调不了这么长时，在 `args` 里加 `"--approval-timeout", "<不超过宿主超时的秒数>"`。否则 PENDING 的调用会被宿主取消，审批通过后也不会转发。
+Cursor 配置示例（项目级 `.cursor/mcp.json`，或全局 `~/.cursor/mcp.json`），与 Claude Desktop 同样使用 `mcpServers` 键，内容相同：
+
+```json
+{
+  "mcpServers": {
+    "guarded-filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "-p",
+        "@aster-cloud/aster-guard",
+        "aster-guard-mcp",
+        "--upstream",
+        "npx -y @modelcontextprotocol/server-filesystem /tmp",
+        "--base-url",
+        "http://localhost:8080",
+        "--policy",
+        "guard.customer/decide",
+        "--principal-id",
+        "agent-claude",
+        "--approval-timeout",
+        "300"
+      ],
+      "env": {
+        "ASTER_GUARD_API_KEY": "ak_xxxxxxxx"
+      }
+    }
+  }
+}
+```
+
+> 宿主超时：上面两例的 `--approval-timeout 300`（秒）要求宿主对这个服务器的请求 / 工具调用超时不小于 300 秒，原因见上文「宿主超时须覆盖审批等待」；宿主超时调不了这么长时，把该值改成不超过宿主超时的秒数。
 >
-> 包只有一个可执行文件 `aster-guard-mcp`，`npx` 会直接运行它，包名之后不要再写 `aster-guard-mcp`（会被当作多余的位置参数而报错）；全局安装后也可把 `command` 写成 `aster-guard-mcp`。
+> `npx -y -p @aster-cloud/aster-guard aster-guard-mcp` 用 `-p` 指明要安装的包，再写要运行的命令名 `aster-guard-mcp`。不要写成 `npx -y @aster-cloud/aster-guard aster-guard-mcp …`：命令名会被当作多余的位置参数而报错（退出码 2）。全局安装后也可直接把 `command` 写成 `aster-guard-mcp`，`args` 去掉前四项。`--base-url` 换成实际的 aster-api 地址；`ASTER_GUARD_API_KEY` 是请求方的 API key。
+
+## 本地端到端
+
+`scripts/e2e-local.mjs` 对本地 aster-api 走一遍真实流程：放行、挂起待审批、审批、读取最终结论。它只调用本包构建出的公开 SDK，不含任何 mock。脚本在仓库内，不随 npm 包发布，需在仓库根目录先 `pnpm build`。
+
+### 前提
+
+1. **运行中的 aster-api**，默认 `http://localhost:8080`。启动方式见 aster-api 仓库 README 的「本地开发」一节（`podman run … postgres` 起数据库，`./gradlew :quarkus-policy-api:quarkusDev` 起服务），此处不再重复。
+2. **已部署的示例策略**（模块 `guard.customer`，函数 `decide`）：
+
+   ```text
+   Module guard.customer.
+
+   Define GuardRequest has principal_id, principal_type, principal_roles, action, resource_type, resource_id, context, agent_model.
+
+   @id("CUST-DEL-001")
+   @control("GDPR:ART17")
+   Rule decide given req as GuardRequest, produce Verdict:
+     If req.action equals to "delete_customer_record":
+       Return Verdict.require_approval("Data Protection Officer", "customer record deletion").
+     Otherwise:
+       Return Verdict.allow().
+   ```
+
+   `delete_customer_record` 需要「Data Protection Officer」审批，其余动作放行。
+3. **两把 API key**：请求方一把；审批方一把。「四眼」规则要求审批人与提交人是不同的已验证身份（用户与 API key 都不同），所以审批步骤必须用第二把 key。
+
+aster-api 没有公开的端点用来创建 API key 或部署策略，二者经 aster-cloud（或直接写库）完成。脚本假定它们已经就绪，所有参数都从环境变量读取。
+
+### 运行
+
+```bash
+pnpm build
+ASTER_GUARD_API_KEY=ak_requester \
+ASTER_GUARD_APPROVER_API_KEY=ak_approver \
+node scripts/e2e-local.mjs
+```
+
+环境变量：
+
+| 变量 | 说明 |
+|---|---|
+| `ASTER_GUARD_API_KEY` | 必填，请求方 API key |
+| `ASTER_GUARD_BASE_URL` | aster-api 根地址，默认 `http://localhost:8080` |
+| `ASTER_GUARD_POLICY` | `<module>/<function>`，默认 `guard.customer/decide` |
+| `ASTER_GUARD_APPROVER_API_KEY` | 审批方 API key，可选；缺省时跳过审批步骤 |
+| `ASTER_GUARD_APPROVER_ROLE` | 审批方业务角色，默认 `Data Protection Officer`，作为 `businessRole`（`X-User-Business-Role` 头）发送 |
+
+每次运行使用全新的 `principal.id`（`e2e-<时间戳>`）和新的幂等键，不会重放旧决策。
+
+### 每一步断言什么
+
+| 步骤 | 动作 | 期望 |
+|---|---|---|
+| 1 | 请求方 `check` `read_customer_record` | `effectiveOutcome` 为 `ALLOW` |
+| 2 | 请求方 `check` `delete_customer_record` | `effectiveOutcome` 为 `PENDING`，且带 `approval.id` |
+| 3 | 审批方 `approve(approvalId, { comment: 'e2e', businessRole })` | 返回 `ok: true` |
+| 4 | 请求方 `get(decisionId)` | `effectiveOutcome` 变为 `ALLOW` |
+
+每步输出一行 `✓` 或 `✗`。任一断言失败时，脚本打印完整的决策（或审批结果）JSON 并以退出码 1 结束；缺少 `ASTER_GUARD_API_KEY` 或 `ASTER_GUARD_POLICY` 格式不对时，用法写到 stderr，退出码 2。
+
+未设置 `ASTER_GUARD_APPROVER_API_KEY` 时，步骤 3、4 不执行，脚本输出 `SKIP: 审批步骤需要第二把 API key (ASTER_GUARD_APPROVER_API_KEY)`，仍以退出码 0 结束（只覆盖了步骤 1、2）。此时步骤 2 产生的待审批记录会留在 aster-api，可用 `guard_list_approvals` / `listApprovals` 查看，或等它过期。
+
+### 接入 MCP 客户端
+
+端到端通过后，可把 `aster-guard-mcp` 接到 Claude Desktop 或 Cursor：配置示例见上文「aster-guard-mcp」一节。被策略要求审批的工具调用会在代理里等待（最长 `--approval-timeout` 秒），由持有第二把 key 的人通过 `listApprovals` / `approve` 批准后才转发给上游。
 
 ## fail-closed 语义
 
