@@ -335,6 +335,52 @@ describe('GuardClient.get / waitFor', () => {
   });
 });
 
+describe('GuardClient.waitFor 中止（signal）', () => {
+  it('signal 已中止 → 不发请求，返回 DENY wait_aborted，保留 decisionId', async () => {
+    const fetchMock = vi.fn(async () => json(200, PENDING));
+    const d = await client(fetchMock).waitFor('d-1', { signal: AbortSignal.abort() });
+    expect(d).toMatchObject(deny('wait_aborted', 'd-1'));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('睡眠中中止 → 立即结束等待，不再轮询，不抛异常', async () => {
+    const fetchMock = vi.fn(async () => json(200, PENDING));
+    // 注入的睡眠永不结束：只有中止能让 waitFor 返回。
+    const sleep = vi.fn(() => new Promise<void>(() => undefined));
+    const controller = new AbortController();
+    const waiting = client(fetchMock, { sleep }).waitFor('d-1', { signal: controller.signal });
+    await vi.waitFor(() => expect(sleep).toHaveBeenCalledTimes(1));
+
+    controller.abort();
+
+    await expect(waiting).resolves.toMatchObject(deny('wait_aborted', 'd-1'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('请求进行中被中止，随后读到 ALLOW 也返回 wait_aborted', async () => {
+    let respond!: (response: Response) => void;
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => (respond = resolve)));
+    const controller = new AbortController();
+    const waiting = client(fetchMock).waitFor('d-1', { signal: controller.signal });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    controller.abort();
+    respond(json(200, ALLOW));
+
+    await expect(waiting).resolves.toMatchObject(deny('wait_aborted', 'd-1'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('未中止时 signal 不影响正常轮询', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(json(200, PENDING)).mockResolvedValueOnce(json(200, ALLOW));
+    const d = await client(fetchMock, { sleep: async () => undefined }).waitFor('d-1', {
+      signal: new AbortController().signal,
+    });
+    expect(d).toEqual(ALLOW);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('GuardClient 审批', () => {
   const APPROVED: GuardDecision = {
     ...PENDING,

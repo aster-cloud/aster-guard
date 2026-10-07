@@ -55,7 +55,7 @@ export interface GuardReceipt {
  *
  * 客户端 fail-closed 产生的 DENY 只有 decisionId（无法取得时为空串）、outcome、effectiveOutcome、
  * reasonCode、reason。客户端 reasonCode：`http_<status>`、`idempotency_mismatch`、`client_error`、
- * `client_timeout`、`wait_timeout`；服务端 reasonCode 另有 `not_a_verdict`、`evaluation_failed`、
+ * `client_timeout`、`wait_timeout`、`wait_aborted`；服务端 reasonCode 另有 `not_a_verdict`、`evaluation_failed`、
  * `receipt_unavailable` 等（§3.2）。
  */
 export interface GuardDecision {
@@ -128,6 +128,11 @@ export interface GuardWaitOptions {
   timeoutMs?: number;
   /** 轮询间隔，默认 2000 ms；须为有限正数。 */
   intervalMs?: number;
+  /**
+   * 调用方放弃等待的信号：中止后不再发起新的轮询，睡眠提前结束，返回 DENY `wait_aborted`（保留 decisionId），
+   * 不抛异常。已发出的那次请求不中断，最长再等一次请求超时。
+   */
+  signal?: AbortSignal;
 }
 
 /** `approve` 的选项。 */

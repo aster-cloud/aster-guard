@@ -1,7 +1,12 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  type ListToolsResult,
+  type Tool,
+} from '@modelcontextprotocol/sdk/types.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createGuardProxyServer, type GuardClientLike, type GuardProxyOptions } from '../src/mcp/proxy.js';
 import type { GuardDecision } from '../src/types.js';
@@ -52,11 +57,23 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
-/** 搭起完整链路；返回 agent 侧 Client、mock guard 与「上游收到的 tools/call」记录。 */
-async function setup(options: Partial<Omit<GuardProxyOptions, 'client' | 'upstream'>> = {}) {
+/** 让已排队的微任务与 I/O 回调跑完；InMemoryTransport 同步投递，无需真实计时。 */
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+type UpstreamList = (cursor: string | undefined) => ListToolsResult;
+
+/**
+ * 搭起完整链路；返回 agent 侧 Client、mock guard、代理、假上游，以及「上游收到的 tools/list 游标 / tools/call」记录。
+ * upstreamList 可替换假上游的 tools/list（用于分页场景）。
+ */
+async function setup(
+  options: Partial<Omit<GuardProxyOptions, 'client' | 'upstream'>> = {},
+  upstreamList: UpstreamList = () => ({ tools: UPSTREAM_TOOLS }),
+) {
   const upstreamCalls = vi.fn<(params: { name: string; arguments?: Record<string, unknown> }) => void>();
+  const upstreamListCalls = vi.fn(upstreamList);
   const fakeUpstream = new Server({ name: 'fake-upstream', version: '1.0.0' }, { capabilities: { tools: {} } });
-  fakeUpstream.setRequestHandler(ListToolsRequestSchema, () => ({ tools: UPSTREAM_TOOLS }));
+  fakeUpstream.setRequestHandler(ListToolsRequestSchema, (request) => upstreamListCalls(request.params?.cursor));
   fakeUpstream.setRequestHandler(CallToolRequestSchema, (request) => {
     upstreamCalls(request.params);
     return { content: [{ type: 'text', text: JSON.stringify(request.params.arguments ?? {}) }] };
@@ -83,7 +100,7 @@ async function setup(options: Partial<Omit<GuardProxyOptions, 'client' | 'upstre
     await proxy.close();
     await fakeUpstream.close();
   });
-  return { agent, guard, upstreamCalls };
+  return { agent, guard, proxy, fakeUpstream, upstreamCalls, upstreamListCalls };
 }
 
 function textOf(result: Awaited<ReturnType<Client['callTool']>>): string {
@@ -151,7 +168,7 @@ describe('aster-guard-mcp 代理：tools/call', () => {
 
     const result = await agent.callTool({ name: 'echo', arguments: { text: 'later' } });
 
-    expect(guard.waitFor).toHaveBeenCalledWith('d-3', { timeoutMs: 1_234 });
+    expect(guard.waitFor).toHaveBeenCalledWith('d-3', { timeoutMs: 1_234, signal: expect.any(AbortSignal) });
     expect(result.isError).toBeFalsy();
     expect(textOf(result)).toBe('{"text":"later"}');
     expect(upstreamCalls).toHaveBeenCalledTimes(1);
@@ -164,7 +181,7 @@ describe('aster-guard-mcp 代理：tools/call', () => {
 
     await agent.callTool({ name: 'echo', arguments: {} });
 
-    expect(guard.waitFor).toHaveBeenCalledWith('d-3', { timeoutMs: 300_000 });
+    expect(guard.waitFor).toHaveBeenCalledWith('d-3', { timeoutMs: 300_000, signal: expect.any(AbortSignal) });
   });
 
   it('PENDING→等待超时（wait_timeout）：拒绝，保留 decisionId，上游未被调用', async () => {
@@ -245,12 +262,29 @@ describe('aster-guard-mcp 代理：tools/call', () => {
 
     const call = agent.callTool({ name: 'echo', arguments: {} }, undefined, { signal: controller.signal });
     await vi.waitFor(() => expect(guard.waitFor).toHaveBeenCalled());
+    const waitSignal = guard.waitFor.mock.calls[0][1]?.signal;
+    expect(waitSignal?.aborted).toBe(false);
+
     controller.abort('agent gave up');
     await expect(call).rejects.toThrow();
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await flush();
+    // 取消经 notifications/cancelled 传到代理，交给 waitFor 的 signal 随之中止，轮询得以停止。
+    expect(waitSignal?.aborted).toBe(true);
     release({ ...ALLOW, decisionId: 'd-3' });
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await flush();
 
+    expect(upstreamCalls).not.toHaveBeenCalled();
+  });
+
+  it('waitFor 抛异常 → 拒绝，文本保留 PENDING 的 decisionId，上游未被调用', async () => {
+    const { agent, guard, upstreamCalls } = await setup();
+    guard.check.mockResolvedValue(PENDING);
+    guard.waitFor.mockRejectedValue(new Error('poll exploded'));
+
+    const result = await agent.callTool({ name: 'echo', arguments: {} });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toBe('Blocked by Aster Guard: poll exploded (decision d-3)');
     expect(upstreamCalls).not.toHaveBeenCalled();
   });
 
@@ -270,6 +304,61 @@ describe('aster-guard-mcp 代理：tools/call', () => {
     const result = await agent.callTool({ name: 'delete_customer', arguments: { customerId: 'C-9' } });
 
     expect(result.isError).toBeFalsy();
+  });
+});
+
+describe('aster-guard-mcp 代理：上游工具名缓存与分页守卫', () => {
+  it('完整列出一次后缓存工具名：已知工具不再向上游 tools/list', async () => {
+    const { agent, guard, upstreamListCalls } = await setup();
+    guard.check.mockResolvedValue(ALLOW);
+
+    await agent.callTool({ name: 'echo', arguments: {} });
+    await agent.callTool({ name: 'delete_customer', arguments: { customerId: 'C-1' } });
+    await agent.callTool({ name: 'echo', arguments: {} });
+
+    expect(upstreamListCalls).toHaveBeenCalledTimes(1);
+  });
+
+  it('跨页收集工具名', async () => {
+    const pages: Record<string, ListToolsResult> = {
+      first: { tools: [UPSTREAM_TOOLS[0]], nextCursor: 'p2' },
+      p2: { tools: [UPSTREAM_TOOLS[1]] },
+    };
+    const { agent, guard, upstreamListCalls } = await setup({}, (cursor) => pages[cursor ?? 'first']);
+    guard.check.mockResolvedValue(ALLOW);
+
+    const result = await agent.callTool({ name: 'delete_customer', arguments: { customerId: 'C-1' } });
+
+    expect(result.isError).toBeFalsy();
+    expect(upstreamListCalls.mock.calls.map(([cursor]) => cursor)).toEqual([undefined, 'p2']);
+  });
+
+  it('上游重复返回同一个 nextCursor：停止翻页，未知工具照常报错', async () => {
+    const { agent, upstreamListCalls } = await setup({}, () => ({ tools: [UPSTREAM_TOOLS[0]], nextCursor: 'again' }));
+
+    await expect(agent.callTool({ name: 'no_such_tool', arguments: {} })).rejects.toThrow(/Unknown tool: no_such_tool/);
+
+    expect(upstreamListCalls.mock.calls.map(([cursor]) => cursor)).toEqual([undefined, 'again']);
+  });
+
+  it('上游游标永不结束：最多翻 100 页', async () => {
+    const { agent, upstreamListCalls } = await setup({}, (cursor) => ({
+      tools: [],
+      nextCursor: `c${Number(cursor?.slice(1) ?? 0) + 1}`,
+    }));
+
+    await expect(agent.callTool({ name: 'no_such_tool', arguments: {} })).rejects.toThrow(/Unknown tool/);
+
+    expect(upstreamListCalls).toHaveBeenCalledTimes(100);
+  });
+
+  it('未知工具每次调用至多触发一次完整刷新', async () => {
+    const { agent, upstreamListCalls } = await setup();
+
+    await expect(agent.callTool({ name: 'nope', arguments: {} })).rejects.toThrow(/Unknown tool/);
+    await expect(agent.callTool({ name: 'nope', arguments: {} })).rejects.toThrow(/Unknown tool/);
+
+    expect(upstreamListCalls).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -308,6 +397,21 @@ describe('aster-guard-mcp 代理：Action 构造', () => {
     expect(second.context).toEqual({});
   });
 
+  it.each([
+    ['字符串', 'C-1', 'C-1'],
+    ['数字', 42, '42'],
+    ['布尔', true, 'true'],
+    ['对象', { tenant: 't1', id: 7 }, '{"tenant":"t1","id":7}'],
+    ['数组', ['a', 'b'], '["a","b"]'],
+  ])('resource.id：%s 参数值序列化为稳定文本（对象 / 数组用 JSON，不是 "[object Object]"）', async (_label, value, expected) => {
+    const { agent, guard } = await setup({ resourceFromArg: 'target' });
+    guard.check.mockResolvedValue(ALLOW);
+
+    await agent.callTool({ name: 'echo', arguments: { target: value } });
+
+    expect(guard.check.mock.calls[0][0].resource).toEqual({ type: 'arg', id: expected });
+  });
+
   it('每次调用使用新的幂等键（不从 JSON-RPC id 派生）', async () => {
     const { agent, guard } = await setup();
     guard.check.mockResolvedValue(ALLOW);
@@ -319,6 +423,19 @@ describe('aster-guard-mcp 代理：Action 构造', () => {
     expect(keys[0]).toMatch(UUID);
     expect(keys[1]).toMatch(UUID);
     expect(keys[0]).not.toBe(keys[1]);
+  });
+});
+
+describe('createGuardProxyServer.close', () => {
+  it('关闭上游且只关闭一次：连续两次 close()，假上游的 onclose 只触发一次', async () => {
+    const { proxy, fakeUpstream } = await setup();
+    const upstreamClosed = vi.fn();
+    fakeUpstream.onclose = upstreamClosed;
+
+    await proxy.close();
+    await proxy.close();
+
+    expect(upstreamClosed).toHaveBeenCalledTimes(1);
   });
 });
 

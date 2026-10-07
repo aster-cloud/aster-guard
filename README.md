@@ -75,7 +75,7 @@ switch (decision.effectiveOutcome) {
 |---|---|
 | `check(action, { idempotencyKey?, waitSeconds? })` | `POST /api/v1/guard/decisions`，返回 `GuardDecision`；`action.principal` 缺省取配置；未给 `idempotencyKey` 时每次调用生成新的 UUID |
 | `get(decisionId)` | `GET /api/v1/guard/decisions/{id}`，读取当前状态 |
-| `waitFor(decisionId, { timeoutMs = 300000, intervalMs = 2000 })` | 轮询直到服务端给出非 PENDING 结论；瞬时失败（网络、超时、5xx、429）继续轮询，其他失败立即返回 DENY；到时返回 DENY `wait_timeout`。两者都保留 decisionId |
+| `waitFor(decisionId, { timeoutMs = 300000, intervalMs = 2000, signal? })` | 轮询直到服务端给出非 PENDING 结论；瞬时失败（网络、超时、5xx、429）继续轮询，其他失败立即返回 DENY；到时返回 DENY `wait_timeout`；`signal` 中止后返回 DENY `wait_aborted`。三者都保留 decisionId |
 | `listApprovals(status = 'PENDING', page = 0, size = 20)` | `GET /api/v1/guard/approvals`，返回 `{ ok: true, items, page, size }` 或 `{ ok: false, … }` |
 | `approve(id, { comment?, businessRole? })` | `POST /api/v1/guard/approvals/{id}/approve`；`businessRole` 作为 `X-User-Business-Role` 头发送 |
 | `reject(id, { comment, businessRole? })` | `POST /api/v1/guard/approvals/{id}/reject`；`comment` 必填，缺失时客户端直接返回 `comment_required` |
@@ -90,8 +90,10 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 
 1. 构造 Action：`action.name` 为工具名，`context` 为工具参数，`principal` 来自配置；指定 `--resource-from <argName>` 时，取该参数的值作为 `resource: { type: 'arg', id }`；`--agent-model` 写入 `agent.model`。
 2. 以新的 UUID 作幂等键调用 `GuardClient.check`（每次调用一个新键，不从 JSON-RPC 请求 id 派生）。
-3. 只有服务端确认的 `ALLOW` 才转发给上游，上游结果原样返回；`DENY` 返回工具错误 `Blocked by Aster Guard: <reason> (decision <id>)`，guard 不可达时 decision 为 `n/a`；`PENDING` 则等待审批，最长 `--approval-timeout` 秒（默认 300），再按最终结论转发或拒绝。等待期间下游取消请求的，审批随后通过也不再转发。
+3. 只有服务端确认的 `ALLOW` 才转发给上游，上游结果原样返回；`DENY` 返回工具错误 `Blocked by Aster Guard: <reason> (decision <id>)`，guard 不可达时 decision 为 `n/a`；`PENDING` 则等待审批，最长 `--approval-timeout` 秒（默认 300），再按最终结论转发或拒绝。等待期间下游取消请求的，代理随即停止轮询，审批随后通过也不再转发。
 4. 上游没有的工具名返回 MCP 协议错误，不发起裁决。
+
+> **宿主超时须覆盖审批等待。** MCP 宿主（客户端）给这次请求 / 工具调用设的超时必须不小于 `--approval-timeout`（MCP TypeScript SDK 的缺省请求超时只有 60 秒），否则就调低 `--approval-timeout`。不然 PENDING 的调用会先被宿主取消，审批即使通过也不会转发给上游。
 
 不指定上游时，只提供五个治理工具，供人机协作场景使用。结果是 JSON 文本，`DENY` 或 `ok: false` 时标记 `isError`：
 
@@ -114,7 +116,7 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 | `--api-key-env <name>` | 存放 API key 的环境变量名，默认 `ASTER_GUARD_API_KEY`；API key 只从环境变量读取 |
 | `--principal-type <type>` | 默认 `agent` |
 | `--principal-roles <a,b>` | 逗号分隔 |
-| `--approval-timeout <seconds>` | 默认 300 |
+| `--approval-timeout <seconds>` | 默认 300；宿主的请求 / 工具调用超时须不小于它（见上文） |
 | `--resource-from <argName>` | 以该工具参数的值作为 `resource.id` |
 | `--agent-model <model>` | 写入 `action.agent.model` |
 
@@ -149,6 +151,8 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）：
 }
 ```
 
+> 宿主超时：上例沿用 `--approval-timeout` 的缺省 300 秒，要求宿主对这个服务器的请求 / 工具调用超时不小于 300 秒；宿主超时调不了这么长时，在 `args` 里加 `"--approval-timeout", "<不超过宿主超时的秒数>"`。否则 PENDING 的调用会被宿主取消，审批通过后也不会转发。
+>
 > 包只有一个可执行文件 `aster-guard-mcp`，`npx` 会直接运行它，包名之后不要再写 `aster-guard-mcp`（会被当作多余的位置参数而报错）；全局安装后也可把 `command` 写成 `aster-guard-mcp`。
 
 ## fail-closed 语义

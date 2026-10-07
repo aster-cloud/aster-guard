@@ -27,7 +27,8 @@ guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject
                                 API key 只从环境变量读取，且不会传给上游进程
   --principal-type <type>       主体类型，缺省 agent
   --principal-roles <a,b>       主体角色，逗号分隔
-  --approval-timeout <seconds>  等待人工审批的最长秒数，缺省 ${DEFAULT_APPROVAL_TIMEOUT_SECONDS}
+  --approval-timeout <seconds>  等待人工审批的最长秒数，缺省 ${DEFAULT_APPROVAL_TIMEOUT_SECONDS}；
+                                MCP 宿主的请求 / 工具调用超时须不小于该值，否则 PENDING 调用会被宿主取消
   --resource-from <argName>     取该工具参数的值作为 resource.id（resource.type 为 arg）
   --agent-model <model>         写入 action.agent.model 的模型名
   -h, --help                    显示本帮助

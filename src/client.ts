@@ -110,21 +110,24 @@ export class GuardClient {
    *
    * - 瞬时失败（未收到响应、5xx、429）不结束等待，继续轮询到截止时刻；
    * - 其他失败（400 / 401 / 403 / 404、不合契约的 2xx 等）立即返回对应 DENY，decisionId 保留为被等待的 id；
-   * - 到时仍未得到结论返回 DENY `wait_timeout`（保留 decisionId），reason 说明最后一次轮询的情况。
+   * - 到时仍未得到结论返回 DENY `wait_timeout`（保留 decisionId），reason 说明最后一次轮询的情况；
+   * - `signal` 中止后返回 DENY `wait_aborted`（保留 decisionId）：调用方已放弃，即使随后读到最终结论也不再返回它。
    *
    * 最后一次睡眠只睡到截止时刻，实际耗时可能再多出一次请求的超时。选项非法属于编程错误，抛 TypeError。
    */
   async waitFor(decisionId: string, opts: GuardWaitOptions = {}): Promise<GuardDecision> {
-    const { timeoutMs = DEFAULT_WAIT_TIMEOUT_MS, intervalMs = DEFAULT_WAIT_INTERVAL_MS } = opts;
+    const { timeoutMs = DEFAULT_WAIT_TIMEOUT_MS, intervalMs = DEFAULT_WAIT_INTERVAL_MS, signal } = opts;
     requireWaitOptions(timeoutMs, intervalMs);
     const deadline = this.now() + timeoutMs;
     for (;;) {
+      if (signal?.aborted) return waitAborted(decisionId);
       const result = await this.readDecision(decisionId);
+      if (signal?.aborted) return waitAborted(decisionId);
       if (result.ok && result.body.effectiveOutcome !== 'PENDING') return result.body;
       if (!result.ok && !isTransient(result)) return { ...denyOf(result), decisionId };
       const remainingMs = deadline - this.now();
       if (remainingMs <= 0) return waitTimeout(decisionId, timeoutMs, result);
-      await this.sleep(Math.min(intervalMs, remainingMs));
+      await sleepUnlessAborted(this.sleep, Math.min(intervalMs, remainingMs), signal);
     }
   }
 
@@ -255,6 +258,24 @@ function isTransient({ status }: GuardApiError): boolean {
 function waitTimeout(decisionId: string, timeoutMs: number, last: Checked<GuardDecision>): GuardDecision {
   const lastPoll = last.ok ? '决策仍为 PENDING' : `最后一次读取失败（${denyReasonCode(last)}：${last.message}）`;
   return { ...clientDeny('wait_timeout', `等待 ${timeoutMs} ms 未得到最终结论，${lastPoll}`), decisionId };
+}
+
+/** 调用方中止等待时的 DENY：保留被等待的 decisionId。 */
+function waitAborted(decisionId: string): GuardDecision {
+  return { ...clientDeny('wait_aborted', '调用方在得到最终结论前中止了等待'), decisionId };
+}
+
+/** 睡眠 ms 毫秒；signal 中止时提前结束（不抛异常）。注入的 sleep 不必理会 signal。 */
+function sleepUnlessAborted(sleep: (ms: number) => Promise<void>, ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return sleep(ms);
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    signal.addEventListener('abort', done, { once: true });
+    sleep(ms).then(done, done);
+  });
 }
 
 /** 客户端侧失败（status 0）与不合契约的 2xx 沿用其错误码；HTTP 错误为 http_<status>，422 为 idempotency_mismatch。 */

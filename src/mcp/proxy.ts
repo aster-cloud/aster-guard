@@ -20,6 +20,9 @@ import { callGovernanceTool, GOVERNANCE_TOOLS } from './standalone-tools.js';
 /** 缺省的人工审批等待时长（§6：`--approval-timeout` 缺省 300 秒）。 */
 const DEFAULT_APPROVAL_TIMEOUT_MS = 300_000;
 
+/** 刷新上游工具名时最多翻的页数：防止上游游标永不结束时无限翻页。 */
+const MAX_TOOL_LIST_PAGES = 100;
+
 /** 代理用到的 GuardClient 方法（便于注入 mock）。 */
 export type GuardClientLike = Pick<GuardClient, 'check' | 'get' | 'waitFor' | 'listApprovals' | 'approve' | 'reject'>;
 
@@ -94,7 +97,7 @@ function installGuardedUpstream(server: Server, upstream: UpstreamClient, option
     if (!(await knownTools.has(name))) {
       throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
     }
-    const decision = await decide(options, toAction(options, name, args));
+    const decision = await decide(options, toAction(options, name, args), extra.signal);
     // 下游已取消（例如客户端等审批等到超时）时，结论来得再晚也不执行副作用——调用方已放弃，
     // 执行了它也不知道，重试就会重复执行；SDK 也不会再发送这次响应。
     if (!isConfirmedAllow(decision) || extra.signal.aborted) {
@@ -106,11 +109,13 @@ function installGuardedUpstream(server: Server, upstream: UpstreamClient, option
 }
 
 /**
- * 上游工具名集合，用于拒绝未知工具。tools/list 转发时顺带记下；遇到没见过的名字时翻完上游全部分页再判定
- * （客户端可能不先 tools/list 就调用，上游工具集也可能已变化）。
+ * 上游工具名缓存，用于拒绝未知工具。tools/list 转发时与完整刷新时都会记下工具名；命中缓存不访问上游。
+ * 未命中时（客户端可能不先 tools/list 就调用，上游工具集也可能已变化）每次调用至多做一次完整刷新，
+ * 并发的未命中共享同一次刷新。
  */
 class UpstreamToolNames {
   private readonly names = new Set<string>();
+  private refreshing: Promise<void> | undefined;
 
   constructor(private readonly upstream: UpstreamClient) {}
 
@@ -120,13 +125,22 @@ class UpstreamToolNames {
 
   async has(name: string): Promise<boolean> {
     if (this.names.has(name)) return true;
-    let cursor: string | undefined;
-    do {
-      const page = await this.upstream.listTools(cursor === undefined ? undefined : { cursor });
-      this.remember(page.tools);
-      cursor = page.nextCursor;
-    } while (cursor !== undefined);
+    this.refreshing ??= this.refresh().finally(() => (this.refreshing = undefined));
+    await this.refreshing;
     return this.names.has(name);
+  }
+
+  /** 翻完上游全部分页；游标重复或超过 MAX_TOOL_LIST_PAGES 页即停止，已收集的工具名照常生效。 */
+  private async refresh(): Promise<void> {
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
+      const result = await this.upstream.listTools(cursor === undefined ? undefined : { cursor });
+      this.remember(result.tools);
+      cursor = result.nextCursor;
+      if (cursor === undefined || seen.has(cursor)) return;
+      seen.add(cursor);
+    }
   }
 }
 
@@ -137,28 +151,39 @@ function toAction(options: GuardProxyOptions, name: string, args: Record<string,
   return {
     principal,
     action: { name },
-    resource: resourceId == null ? undefined : { type: 'arg', id: String(resourceId) },
+    resource: resourceId == null ? undefined : { type: 'arg', id: resourceIdText(resourceId) },
     context: args ?? {},
     agent: agentModel ? { model: agentModel } : undefined,
   };
 }
 
 /**
- * 取得最终结论：check；PENDING 则 waitFor 到 approvalTimeoutMs。
+ * resource.id 的文本：字符串、数字、布尔按 String()；对象与数组用 JSON，
+ * 避免不同资源都变成 "[object Object]" 而共用一个 id。
+ */
+function resourceIdText(value: unknown): string {
+  return typeof value === 'object' ? JSON.stringify(value) : String(value);
+}
+
+/**
+ * 取得最终结论：check；PENDING 则 waitFor 到 approvalTimeoutMs。signal 为这次 tools/call 的取消信号，
+ * 下游取消后 waitFor 随之停止轮询。
  *
  * 每次 tools/call 用新的 UUID 作幂等键：键只代表这一次动作尝试，绝不从 JSON-RPC 请求 id 派生——
  * 后者在重连或换会话后会重复，让不同动作撞键（§6）。GuardClient 约定不抛异常；注入的实现若抛出，
- * 同样按 fail-closed 处理为 DENY。
+ * 同样按 fail-closed 处理为 DENY，并保留已知的 PENDING decisionId 便于追查。
  */
-async function decide(options: ResolvedOptions, action: GuardAction): Promise<GuardDecision> {
+async function decide(options: ResolvedOptions, action: GuardAction, signal: AbortSignal): Promise<GuardDecision> {
   const { client, approvalTimeoutMs } = options;
+  let decisionId = '';
   try {
     const decision = await client.check(action, { idempotencyKey: randomUUID() });
     if (decision.effectiveOutcome !== 'PENDING') return decision;
-    return await client.waitFor(decision.decisionId, { timeoutMs: approvalTimeoutMs });
+    decisionId = decision.decisionId;
+    return await client.waitFor(decisionId, { timeoutMs: approvalTimeoutMs, signal });
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
-    return { decisionId: '', outcome: 'DENY', effectiveOutcome: 'DENY', reasonCode: 'client_error', reason };
+    return { decisionId, outcome: 'DENY', effectiveOutcome: 'DENY', reasonCode: 'client_error', reason };
   }
 }
 
