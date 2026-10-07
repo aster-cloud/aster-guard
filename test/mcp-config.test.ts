@@ -33,6 +33,8 @@ describe('parseCliArgs', () => {
         'ops-bot, support,,',
         '--approval-timeout',
         '90',
+        '--upstream-timeout',
+        '120',
         '--resource-from',
         'customerId',
         '--agent-model',
@@ -50,12 +52,13 @@ describe('parseCliArgs', () => {
       policyFunction: 'decide',
       principal: { id: 'agent-42', type: 'service', roles: ['ops-bot', 'support'] },
       approvalTimeoutMs: 90_000,
+      upstreamTimeoutMs: 120_000,
       resourceFromArg: 'customerId',
       agentModel: 'claude-x',
     });
   });
 
-  it('缺省值：无上游、API key 取 ASTER_GUARD_API_KEY、主体类型 agent、审批等待 300 秒', () => {
+  it('缺省值：无上游、API key 取 ASTER_GUARD_API_KEY、主体类型 agent、审批等待 300 秒、上游超时 600 秒', () => {
     const config = parseCliArgs(REQUIRED, ENV);
 
     expect(config).toEqual({
@@ -66,7 +69,31 @@ describe('parseCliArgs', () => {
       policyFunction: 'decide',
       principal: { id: 'agent-42', type: 'agent' },
       approvalTimeoutMs: 300_000,
+      upstreamTimeoutMs: 600_000,
     });
+  });
+
+  it('Action 文本限制的边界值可以通过：255 字符的主体 id / 类型 / 模型名、16 个角色', () => {
+    const roles = Array.from({ length: 16 }, (_, i) => `role-${i}`);
+    const config = parseCliArgs(
+      [
+        ...REQUIRED,
+        '--principal-id',
+        'i'.repeat(255),
+        '--principal-type',
+        't'.repeat(255),
+        '--principal-roles',
+        roles.join(','),
+        '--agent-model',
+        'm'.repeat(255),
+        '--upstream-timeout',
+        '2147483',
+      ],
+      ENV,
+    );
+    expect(config.principal).toEqual({ id: 'i'.repeat(255), type: 't'.repeat(255), roles });
+    expect(config.agentModel).toBe('m'.repeat(255));
+    expect(config.upstreamTimeoutMs).toBe(2_147_483_000);
   });
 
   it('支持 --flag=value 写法与小数秒', () => {
@@ -103,6 +130,19 @@ describe('parseCliArgs', () => {
     ['--approval-timeout 非数字', ['--approval-timeout', 'abc']],
     ['--approval-timeout 负数', ['--approval-timeout=-1']],
     ['--approval-timeout 空串', ['--approval-timeout', '']],
+    ['--upstream-timeout 为 0', ['--upstream-timeout', '0']],
+    ['--upstream-timeout 负数', ['--upstream-timeout=-1']],
+    ['--upstream-timeout 小数', ['--upstream-timeout', '1.5']],
+    ['--upstream-timeout 非数字', ['--upstream-timeout', 'abc']],
+    ['--upstream-timeout 超过计时器上限', ['--upstream-timeout', '2147484']],
+    ['--principal-id 超过 255 字符', ['--principal-id', 'i'.repeat(256)]],
+    ['--principal-id 含控制字符', ['--principal-id', 'agent\u000742']],
+    ['--principal-type 超过 255 字符', ['--principal-type', 't'.repeat(256)]],
+    ['--agent-model 超过 255 字符', ['--agent-model', 'm'.repeat(256)]],
+    ['--agent-model 含控制字符', ['--agent-model', 'claude\u0085x']],
+    ['--principal-roles 超过 16 项', ['--principal-roles', Array.from({ length: 17 }, (_, i) => `r${i}`).join(',')]],
+    ['--principal-roles 某项超过 255 字符', ['--principal-roles', `ops,${'r'.repeat(256)}`]],
+    ['--principal-roles 某项含控制字符', ['--principal-roles', 'ops,sup\u0001port']],
     ['--upstream 为空', ['--upstream', '   ']],
     ['--upstream 引号未闭合', ['--upstream', "node 'server.js"]],
     ['未知参数', ['--bogus', 'x']],
@@ -131,6 +171,7 @@ describe('wantsHelp', () => {
       '--principal-type',
       '--principal-roles',
       '--approval-timeout',
+      '--upstream-timeout',
       '--resource-from',
       '--agent-model',
       '--help',

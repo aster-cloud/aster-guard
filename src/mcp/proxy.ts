@@ -1,7 +1,8 @@
 // aster-guard-mcp 的 MCP 服务器（ADR 0040 §6）。
 // 有上游：原样转发 tools/list，拦截每一次 tools/call 先过 guard，只有服务端确认的 ALLOW 才转发；
 // 无上游：只提供五个治理工具（standalone-tools.ts）。两种模式共用同一个低层 Server，上游工具 schema 原样透传。
-import { randomUUID } from 'node:crypto';
+// 幂等键用全局 crypto.randomUUID（与 GuardClient 一致）；node:crypto 只用于 resource.id 的哈希。
+import { createHash } from 'node:crypto';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import {
@@ -10,15 +11,28 @@ import {
   ListToolsRequestSchema,
   McpError,
   type CallToolResult,
+  type Progress,
+  type ProgressToken,
+  type ServerNotification,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { GuardClient } from '../client.js';
 import { VERSION } from '../index.js';
 import type { GuardAction, GuardDecision, GuardPrincipal } from '../types.js';
+import { isActionText } from './action-limits.js';
 import { callGovernanceTool, GOVERNANCE_TOOLS } from './standalone-tools.js';
 
 /** 缺省的人工审批等待时长（§6：`--approval-timeout` 缺省 300 秒）。 */
 const DEFAULT_APPROVAL_TIMEOUT_MS = 300_000;
+
+/**
+ * 缺省的上游请求超时（`--upstream-timeout` 缺省 600 秒）。不设的话 SDK 用 60 秒：耗时长的上游工具在 guard
+ * 已放行后被代理掐断，上游却仍在执行，宿主重试就会在新的决策下重复副作用。
+ */
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 600_000;
+
+/** setTimeout 能表示的最大毫秒数；超过时 Node 会把计时器改成 1 ms，每次上游调用都会立刻超时。 */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /** 刷新上游工具名时最多翻的页数：防止上游游标永不结束时无限翻页。 */
 const MAX_TOOL_LIST_PAGES = 100;
@@ -37,6 +51,11 @@ export interface GuardProxyOptions {
   principal: GuardPrincipal;
   /** PENDING 时等待人工审批的最长毫秒数，缺省 300000；须 ≥ 0。 */
   approvalTimeoutMs?: number;
+  /**
+   * 对上游 tools/call 与 tools/list 的请求超时毫秒数，缺省 600000；须为 1–2147483647 的数。
+   * 上游每报告一次 progress 计时重新开始。
+   */
+  upstreamTimeoutMs?: number;
   /** 取该工具参数的值作为 `resource: { type: 'arg', id }`。 */
   resourceFromArg?: string;
   /** 写入 `action.agent.model`。 */
@@ -44,7 +63,7 @@ export interface GuardProxyOptions {
 }
 
 /** 缺省值已落定的选项。 */
-type ResolvedOptions = GuardProxyOptions & { approvalTimeoutMs: number };
+type ResolvedOptions = GuardProxyOptions & { approvalTimeoutMs: number; upstreamTimeoutMs: number };
 
 export interface GuardProxy {
   server: Server;
@@ -53,14 +72,21 @@ export interface GuardProxy {
 }
 
 export function createGuardProxyServer(options: GuardProxyOptions): GuardProxy {
-  const { upstream, approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS } = options;
+  const {
+    upstream,
+    approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS,
+    upstreamTimeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS,
+  } = options;
   // !(x >= 0) 同时拦下 NaN 与负数；与 GuardClient.waitFor 的约束一致，在构造时而不是首次 PENDING 时暴露。
   if (typeof approvalTimeoutMs !== 'number' || !(approvalTimeoutMs >= 0)) {
     throw new TypeError('createGuardProxyServer: approvalTimeoutMs 须为 ≥ 0 的数');
   }
+  if (typeof upstreamTimeoutMs !== 'number' || !(upstreamTimeoutMs >= 1 && upstreamTimeoutMs <= MAX_TIMER_MS)) {
+    throw new TypeError(`createGuardProxyServer: upstreamTimeoutMs 须为 1–${MAX_TIMER_MS} 的数`);
+  }
   const server = new Server({ name: 'aster-guard-mcp', version: VERSION }, { capabilities: { tools: {} } });
   if (upstream) {
-    installGuardedUpstream(server, upstream, { ...options, approvalTimeoutMs });
+    installGuardedUpstream(server, upstream, { ...options, approvalTimeoutMs, upstreamTimeoutMs });
   } else {
     installGovernanceTools(server, options);
   }
@@ -84,10 +110,11 @@ function installGovernanceTools(server: Server, options: GuardProxyOptions): voi
 }
 
 function installGuardedUpstream(server: Server, upstream: UpstreamClient, options: ResolvedOptions): void {
-  const knownTools = new UpstreamToolNames(upstream);
+  const timeout = options.upstreamTimeoutMs;
+  const knownTools = new UpstreamToolNames(upstream, timeout);
 
-  server.setRequestHandler(ListToolsRequestSchema, async (request) => {
-    const result = await upstream.listTools(request.params);
+  server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
+    const result = await upstream.listTools(request.params, { signal: extra.signal, timeout });
     knownTools.remember(result.tools);
     return result;
   });
@@ -103,9 +130,34 @@ function installGuardedUpstream(server: Server, upstream: UpstreamClient, option
     if (!isConfirmedAllow(decision) || extra.signal.aborted) {
       return blocked(decision);
     }
-    // 传入 signal：转发期间下游取消时，把取消传给上游。
-    return upstream.callTool({ name, arguments: args }, undefined, { signal: extra.signal });
+    // 传入 signal：转发期间下游取消时，把取消传给上游。超时到时 SDK 以 McpError(RequestTimeout) 拒绝，
+    // 经本处理函数抛出，下游收到协议错误而不是成功结果。
+    return upstream.callTool({ name, arguments: args }, undefined, {
+      signal: extra.signal,
+      timeout,
+      resetTimeoutOnProgress: true,
+      onprogress: relayProgress(server, request.params._meta?.progressToken, extra.sendNotification),
+    });
   });
+}
+
+/**
+ * 上游 progress 的处理函数。总是登记：SDK 只有登记了 onprogress 才会向上游申请 progress，
+ * resetTimeoutOnProgress 也才生效。下游请求带了 progressToken 时，以该 token 原样转发给下游，否则丢弃。
+ * 经 extra.sendNotification 发送（即带上 relatedRequestId 的 server.notification），下游请求已取消时 SDK 自动不发。
+ */
+function relayProgress(
+  server: Server,
+  progressToken: ProgressToken | undefined,
+  send: (notification: ServerNotification) => Promise<void>,
+): (progress: Progress) => void {
+  return ({ progress, total, message }) => {
+    if (progressToken === undefined) return;
+    // progress 只是提示：发送失败（如下游已断开）不影响这次调用，交给 onerror 记录即可。
+    send({ method: 'notifications/progress', params: { progressToken, progress, total, message } }).catch((e: unknown) =>
+      server.onerror?.(e instanceof Error ? e : new Error(String(e))),
+    );
+  };
 }
 
 /**
@@ -117,7 +169,10 @@ class UpstreamToolNames {
   private readonly names = new Set<string>();
   private refreshing: Promise<void> | undefined;
 
-  constructor(private readonly upstream: UpstreamClient) {}
+  constructor(
+    private readonly upstream: UpstreamClient,
+    private readonly timeout: number,
+  ) {}
 
   remember(tools: Tool[]): void {
     for (const tool of tools) this.names.add(tool.name);
@@ -135,7 +190,7 @@ class UpstreamToolNames {
     const seen = new Set<string>();
     let cursor: string | undefined;
     for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
-      const result = await this.upstream.listTools(cursor === undefined ? undefined : { cursor });
+      const result = await this.upstream.listTools(cursor === undefined ? undefined : { cursor }, { timeout: this.timeout });
       this.remember(result.tools);
       cursor = result.nextCursor;
       if (cursor === undefined || seen.has(cursor)) return;
@@ -144,7 +199,10 @@ class UpstreamToolNames {
   }
 }
 
-/** 由一次 tools/call 构造 Action：action.name 为工具名，context 为工具参数（§6）。 */
+/**
+ * 由一次 tools/call 构造 Action：action.name 为工具名，context 为剔除 null 后的工具参数（§6）。
+ * 转发给上游的仍是原始参数，规整只作用于提交给 guard 的 Action。
+ */
 function toAction(options: GuardProxyOptions, name: string, args: Record<string, unknown> | undefined): GuardAction {
   const { principal, resourceFromArg, agentModel } = options;
   const resourceId = resourceFromArg === undefined ? undefined : args?.[resourceFromArg];
@@ -152,17 +210,37 @@ function toAction(options: GuardProxyOptions, name: string, args: Record<string,
     principal,
     action: { name },
     resource: resourceId == null ? undefined : { type: 'arg', id: resourceIdText(resourceId) },
-    context: args ?? {},
+    context: withoutNullEntries(args ?? {}),
     agent: agentModel ? { model: agentModel } : undefined,
   };
 }
 
 /**
- * resource.id 的文本：字符串、数字、布尔按 String()；对象与数组用 JSON，
- * 避免不同资源都变成 "[object Object]" 而共用一个 id。
+ * 递归剔除值为 null / undefined 的键与数组元素。服务端 context 不接受 null 值（整次请求 400），
+ * 而宿主与模型常以 null 表示「未提供的可选参数」；对规则而言 null 与缺省等价。
+ */
+function withoutNullEntries(record: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(record)
+      .filter(([, value]) => value != null)
+      .map(([key, value]) => [key, withoutNulls(value)]),
+  );
+}
+
+function withoutNulls(value: unknown): unknown {
+  if (Array.isArray(value)) return value.filter((item) => item != null).map(withoutNulls);
+  if (typeof value === 'object' && value !== null) return withoutNullEntries(value as Record<string, unknown>);
+  return value;
+}
+
+/**
+ * resource.id 的文本：字符串、数字、布尔按 String()；对象与数组用 JSON，避免不同资源都变成 "[object Object]"
+ * 而共用一个 id。结果超出服务端文本字段限制（> 255 字符或含控制字符）时改用 `sha256:<hex>`：
+ * 同一资源得到同一 id，且不会让整次请求被服务端拒绝。
  */
 function resourceIdText(value: unknown): string {
-  return typeof value === 'object' ? JSON.stringify(value) : String(value);
+  const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  return isActionText(text) ? text : `sha256:${createHash('sha256').update(text).digest('hex')}`;
 }
 
 /**
@@ -177,7 +255,7 @@ async function decide(options: ResolvedOptions, action: GuardAction, signal: Abo
   const { client, approvalTimeoutMs } = options;
   let decisionId = '';
   try {
-    const decision = await client.check(action, { idempotencyKey: randomUUID() });
+    const decision = await client.check(action, { idempotencyKey: crypto.randomUUID() });
     if (decision.effectiveOutcome !== 'PENDING') return decision;
     decisionId = decision.decisionId;
     return await client.waitFor(decisionId, { timeoutMs: approvalTimeoutMs, signal });

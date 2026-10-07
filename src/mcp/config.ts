@@ -2,12 +2,19 @@
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import type { GuardPrincipal } from '../types.js';
+import { hasControlChar, MAX_ROLES, MAX_TEXT_LENGTH } from './action-limits.js';
 
 /** 缺省的 API key 环境变量名。API key 只从环境变量读取，不接受命令行传入（argv 对同机其他进程可见）。 */
 export const DEFAULT_API_KEY_ENV = 'ASTER_GUARD_API_KEY';
 
 /** 缺省的人工审批等待秒数（§6）。 */
 const DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300;
+
+/** 缺省的上游请求超时秒数。 */
+const DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 600;
+
+/** 上游超时秒数的上限：换算成毫秒后须在 setTimeout 的 32 位范围内（约 24.8 天）。 */
+const MAX_UPSTREAM_TIMEOUT_SECONDS = 2_147_483;
 
 export const USAGE = `用法：aster-guard-mcp --base-url <url> --policy <module>/<function> --principal-id <id> [选项]
 
@@ -26,12 +33,18 @@ guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject
   --api-key-env <name>          存放 API key 的环境变量名，缺省 ${DEFAULT_API_KEY_ENV}；
                                 API key 只从环境变量读取，且不会传给上游进程
   --principal-type <type>       主体类型，缺省 agent
-  --principal-roles <a,b>       主体角色，逗号分隔
+  --principal-roles <a,b>       主体角色，逗号分隔，至多 ${MAX_ROLES} 项
   --approval-timeout <seconds>  等待人工审批的最长秒数，缺省 ${DEFAULT_APPROVAL_TIMEOUT_SECONDS}；
                                 MCP 宿主的请求 / 工具调用超时须不小于该值，否则 PENDING 调用会被宿主取消
-  --resource-from <argName>     取该工具参数的值作为 resource.id（resource.type 为 arg）
+  --upstream-timeout <seconds>  放行后等待上游工具返回的最长秒数（正整数），缺省 ${DEFAULT_UPSTREAM_TIMEOUT_SECONDS}；
+                                上游每报告一次 progress 重新计时，超时后下游收到 RequestTimeout 错误
+  --resource-from <argName>     取该工具参数的值作为 resource.id（resource.type 为 arg）；
+                                超过 ${MAX_TEXT_LENGTH} 字符或含控制字符时改用 sha256:<hex>
   --agent-model <model>         写入 action.agent.model 的模型名
   -h, --help                    显示本帮助
+
+--principal-id / --principal-type / --agent-model 与每个角色须为 1–${MAX_TEXT_LENGTH} 字符且不含控制字符
+（aster-api 对 Action 文本字段的限制），否则以参数错误退出。
 
 stdout 是 MCP 通道，日志一律写到 stderr。
 `;
@@ -56,6 +69,7 @@ export interface ProxyConfig {
   policyFunction: string;
   principal: GuardPrincipal;
   approvalTimeoutMs: number;
+  upstreamTimeoutMs: number;
   resourceFromArg?: string;
   agentModel?: string;
 }
@@ -69,6 +83,7 @@ const OPTIONS = {
   'principal-type': { type: 'string' },
   'principal-roles': { type: 'string' },
   'approval-timeout': { type: 'string' },
+  'upstream-timeout': { type: 'string' },
   'resource-from': { type: 'string' },
   'agent-model': { type: 'string' },
   help: { type: 'boolean', short: 'h' },
@@ -83,6 +98,31 @@ function optionalText(flag: string) {
   return z.string().trim().min(1, `--${flag} 不能为空`).optional();
 }
 
+/**
+ * 写入 Action 文本字段的值：≤ 255 字符且不含控制字符（服务端 GuardActionMapper 的限制）。
+ * 在启动时拒绝，而不是让每一次 check 都变成 DENY http_400。
+ */
+function actionText(schema: z.ZodString, label: string) {
+  return schema
+    .max(MAX_TEXT_LENGTH, `${label} 不能超过 ${MAX_TEXT_LENGTH} 个字符`)
+    .refine((value) => !hasControlChar(value), `${label} 不能含控制字符`);
+}
+
+/** 逗号分隔的角色表：去掉各项首尾空白与空项，至多 16 项，每项按 Action 文本字段校验。 */
+const rolesList = z
+  .string()
+  .transform((value) =>
+    value
+      .split(',')
+      .map((role) => role.trim())
+      .filter((role) => role !== ''),
+  )
+  .pipe(
+    z
+      .array(actionText(z.string(), '--principal-roles 的每一项'))
+      .max(MAX_ROLES, `--principal-roles 不能超过 ${MAX_ROLES} 项`),
+  );
+
 const CliSchema = z.object({
   upstream: z.string().optional(),
   'base-url': z.url({
@@ -91,15 +131,26 @@ const CliSchema = z.object({
   }),
   'api-key-env': optionalText('api-key-env'),
   policy: requiredText('policy').regex(/^[^/\s]+\/[^/\s]+$/, '--policy 须为 <module>/<function>，如 guard.customer/decide'),
-  'principal-id': requiredText('principal-id'),
-  'principal-type': optionalText('principal-type'),
-  'principal-roles': z.string().optional(),
+  'principal-id': actionText(requiredText('principal-id'), '--principal-id'),
+  'principal-type': actionText(z.string().trim().min(1, '--principal-type 不能为空'), '--principal-type').optional(),
+  'principal-roles': rolesList.optional(),
   'approval-timeout': z
     .string()
     .regex(/^\d+(\.\d+)?$/, '--approval-timeout 须为非负秒数')
     .optional(),
+  'upstream-timeout': z
+    .string()
+    .regex(/^\d+$/, '--upstream-timeout 须为正整数秒')
+    .transform(Number)
+    .pipe(
+      z
+        .number()
+        .min(1, '--upstream-timeout 须为正整数秒')
+        .max(MAX_UPSTREAM_TIMEOUT_SECONDS, `--upstream-timeout 不能超过 ${MAX_UPSTREAM_TIMEOUT_SECONDS} 秒`),
+    )
+    .optional(),
   'resource-from': optionalText('resource-from'),
-  'agent-model': optionalText('agent-model'),
+  'agent-model': actionText(z.string().trim().min(1, '--agent-model 不能为空'), '--agent-model').optional(),
 });
 
 /** argv 中是否请求帮助。宽松解析：即使其他参数缺失或非法也能识别 --help / -h。 */
@@ -124,10 +175,7 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
     throw new ConfigError(`环境变量 ${apiKeyEnv} 未设置 API key`);
   }
   const [policyModule, policyFunction] = options.policy.split('/');
-  const roles = options['principal-roles']
-    ?.split(',')
-    .map((role) => role.trim())
-    .filter((role) => role !== '');
+  const roles = options['principal-roles'];
   return {
     ...(options.upstream === undefined ? {} : { upstream: parseUpstream(options.upstream) }),
     baseUrl: options['base-url'],
@@ -141,6 +189,7 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
       ...(roles?.length ? { roles } : {}),
     },
     approvalTimeoutMs: Math.round(Number(options['approval-timeout'] ?? DEFAULT_APPROVAL_TIMEOUT_SECONDS) * 1000),
+    upstreamTimeoutMs: (options['upstream-timeout'] ?? DEFAULT_UPSTREAM_TIMEOUT_SECONDS) * 1000,
     ...(options['resource-from'] === undefined ? {} : { resourceFromArg: options['resource-from'] }),
     ...(options['agent-model'] === undefined ? {} : { agentModel: options['agent-model'] }),
   };

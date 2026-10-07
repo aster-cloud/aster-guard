@@ -1,13 +1,22 @@
+import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import {
   CallToolRequestSchema,
+  CallToolResultSchema,
+  ErrorCode,
   ListToolsRequestSchema,
+  type CallToolRequest,
+  type CallToolResult,
+  type JSONRPCMessage,
   type ListToolsResult,
+  type ServerNotification,
+  type ServerRequest,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { createGuardProxyServer, type GuardClientLike, type GuardProxyOptions } from '../src/mcp/proxy.js';
 import type { GuardDecision } from '../src/types.js';
 
@@ -60,23 +69,33 @@ afterEach(async () => {
 /** 让已排队的微任务与 I/O 回调跑完；InMemoryTransport 同步投递，无需真实计时。 */
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-type UpstreamList = (cursor: string | undefined) => ListToolsResult;
+type UpstreamList = (cursor: string | undefined) => ListToolsResult | Promise<ListToolsResult>;
+type UpstreamCall = (
+  request: CallToolRequest,
+  extra: RequestHandlerExtra<ServerRequest, ServerNotification>,
+) => CallToolResult | Promise<CallToolResult>;
+
+/** 假上游 tools/call 的缺省行为：把参数原样作为文本返回。 */
+const echoCall: UpstreamCall = (request) => ({
+  content: [{ type: 'text', text: JSON.stringify(request.params.arguments ?? {}) }],
+});
 
 /**
- * 搭起完整链路；返回 agent 侧 Client、mock guard、代理、假上游，以及「上游收到的 tools/list 游标 / tools/call」记录。
- * upstreamList 可替换假上游的 tools/list（用于分页场景）。
+ * 搭起完整链路；返回 agent 侧 Client、mock guard、代理、假上游，「上游收到的 tools/list 游标 / tools/call」记录，
+ * 以及代理发给 agent 的通知原文。fakes 可替换假上游的 tools/list（分页、挂起）与 tools/call（慢、progress）。
  */
 async function setup(
   options: Partial<Omit<GuardProxyOptions, 'client' | 'upstream'>> = {},
-  upstreamList: UpstreamList = () => ({ tools: UPSTREAM_TOOLS }),
+  fakes: { list?: UpstreamList; call?: UpstreamCall } = {},
 ) {
-  const upstreamCalls = vi.fn<(params: { name: string; arguments?: Record<string, unknown> }) => void>();
-  const upstreamListCalls = vi.fn(upstreamList);
+  const { list = () => ({ tools: UPSTREAM_TOOLS }), call = echoCall } = fakes;
+  const upstreamCalls = vi.fn<(params: CallToolRequest['params']) => void>();
+  const upstreamListCalls = vi.fn(list);
   const fakeUpstream = new Server({ name: 'fake-upstream', version: '1.0.0' }, { capabilities: { tools: {} } });
   fakeUpstream.setRequestHandler(ListToolsRequestSchema, (request) => upstreamListCalls(request.params?.cursor));
-  fakeUpstream.setRequestHandler(CallToolRequestSchema, (request) => {
+  fakeUpstream.setRequestHandler(CallToolRequestSchema, (request, extra) => {
     upstreamCalls(request.params);
-    return { content: [{ type: 'text', text: JSON.stringify(request.params.arguments ?? {}) }] };
+    return call(request, extra);
   });
   const [upstreamClientSide, upstreamServerSide] = InMemoryTransport.createLinkedPair();
   await fakeUpstream.connect(upstreamServerSide);
@@ -94,14 +113,38 @@ async function setup(
   await proxy.server.connect(proxySide);
   const agent = new Client({ name: 'agent', version: '0.0.0' });
   await agent.connect(agentSide);
+  // 窃听代理发给 agent 的通知（如转发的 progress），断言线上原文而不只是 SDK 回调。
+  const agentNotifications: JSONRPCMessage[] = [];
+  const deliver = agentSide.onmessage;
+  agentSide.onmessage = (message, extra) => {
+    if (!('id' in message)) agentNotifications.push(message);
+    deliver?.(message, extra);
+  };
 
   cleanups.push(async () => {
     await agent.close();
     await proxy.close();
     await fakeUpstream.close();
   });
-  return { agent, guard, proxy, fakeUpstream, upstreamCalls, upstreamListCalls };
+  return { agent, guard, proxy, fakeUpstream, upstreamCalls, upstreamListCalls, agentNotifications };
 }
+
+/** 记下 promise 是否已落定，以便推进假时钟时断言「尚未返回」。 */
+function settledState<T>(promise: Promise<T>) {
+  const state = { settled: false, promise };
+  promise.then(
+    () => (state.settled = true),
+    () => (state.settled = true),
+  );
+  return state;
+}
+
+/** 只假冒 setTimeout / clearTimeout：flush 依赖的 setImmediate 保持真实。 */
+function useFakeClock(): void {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 function textOf(result: Awaited<ReturnType<Client['callTool']>>): string {
   const content = result.content as Array<{ type: string; text?: string }>;
@@ -324,7 +367,7 @@ describe('aster-guard-mcp 代理：上游工具名缓存与分页守卫', () => 
       first: { tools: [UPSTREAM_TOOLS[0]], nextCursor: 'p2' },
       p2: { tools: [UPSTREAM_TOOLS[1]] },
     };
-    const { agent, guard, upstreamListCalls } = await setup({}, (cursor) => pages[cursor ?? 'first']);
+    const { agent, guard, upstreamListCalls } = await setup({}, { list: (cursor) => pages[cursor ?? 'first'] });
     guard.check.mockResolvedValue(ALLOW);
 
     const result = await agent.callTool({ name: 'delete_customer', arguments: { customerId: 'C-1' } });
@@ -334,7 +377,7 @@ describe('aster-guard-mcp 代理：上游工具名缓存与分页守卫', () => 
   });
 
   it('上游重复返回同一个 nextCursor：停止翻页，未知工具照常报错', async () => {
-    const { agent, upstreamListCalls } = await setup({}, () => ({ tools: [UPSTREAM_TOOLS[0]], nextCursor: 'again' }));
+    const { agent, upstreamListCalls } = await setup({}, { list: () => ({ tools: [UPSTREAM_TOOLS[0]], nextCursor: 'again' }) });
 
     await expect(agent.callTool({ name: 'no_such_tool', arguments: {} })).rejects.toThrow(/Unknown tool: no_such_tool/);
 
@@ -342,10 +385,10 @@ describe('aster-guard-mcp 代理：上游工具名缓存与分页守卫', () => 
   });
 
   it('上游游标永不结束：最多翻 100 页', async () => {
-    const { agent, upstreamListCalls } = await setup({}, (cursor) => ({
-      tools: [],
-      nextCursor: `c${Number(cursor?.slice(1) ?? 0) + 1}`,
-    }));
+    const { agent, upstreamListCalls } = await setup(
+      {},
+      { list: (cursor) => ({ tools: [], nextCursor: `c${Number(cursor?.slice(1) ?? 0) + 1}` }) },
+    );
 
     await expect(agent.callTool({ name: 'no_such_tool', arguments: {} })).rejects.toThrow(/Unknown tool/);
 
@@ -381,7 +424,7 @@ describe('aster-guard-mcp 代理：Action 构造', () => {
     expect(opts?.idempotencyKey).toMatch(UUID);
   });
 
-  it('未配置 resourceFromArg、参数缺失或为 null 时不带 resource；无参数时 context 为 {}', async () => {
+  it('未配置 resourceFromArg、参数缺失或为 null 时不带 resource；null 参数从 context 剔除；无参数时 context 为 {}', async () => {
     const { agent, guard } = await setup({ resourceFromArg: 'customerId' });
     guard.check.mockResolvedValue(ALLOW);
 
@@ -392,9 +435,30 @@ describe('aster-guard-mcp 代理：Action 构造', () => {
     const [second] = guard.check.mock.calls[1];
     expect(first.resource).toBeUndefined();
     expect(first.agent).toBeUndefined();
-    expect(first.context).toEqual({ customerId: null });
+    expect(first.context).toStrictEqual({});
     expect(second.resource).toBeUndefined();
-    expect(second.context).toEqual({});
+    expect(second.context).toStrictEqual({});
+  });
+
+  it('context 递归剔除 null 键与数组中的 null 元素（服务端拒绝 null 值）；上游仍收到原始参数', async () => {
+    const { agent, guard, upstreamCalls } = await setup();
+    guard.check.mockResolvedValue(ALLOW);
+    const args = {
+      keep: 0,
+      drop: null,
+      nested: { gone: null, list: [1, null, { gone: null, flag: false }], text: '' },
+      empty: [null],
+    };
+
+    const result = await agent.callTool({ name: 'echo', arguments: args });
+
+    expect(result.isError).toBeFalsy();
+    expect(guard.check.mock.calls[0][0].context).toStrictEqual({
+      keep: 0,
+      nested: { list: [1, { flag: false }], text: '' },
+      empty: [],
+    });
+    expect(upstreamCalls.mock.calls[0][0].arguments).toStrictEqual(args);
   });
 
   it.each([
@@ -412,7 +476,27 @@ describe('aster-guard-mcp 代理：Action 构造', () => {
     expect(guard.check.mock.calls[0][0].resource).toEqual({ type: 'arg', id: expected });
   });
 
-  it('每次调用使用新的幂等键（不从 JSON-RPC id 派生）', async () => {
+  const sha256 = (text: string) => `sha256:${createHash('sha256').update(text).digest('hex')}`;
+  const longObject = { blob: 'y'.repeat(300) };
+
+  it.each([
+    ['超过 255 字符的字符串 → sha256', 'x'.repeat(256), sha256('x'.repeat(256))],
+    ['JSON 超过 255 字符的对象 → JSON 的 sha256', longObject, sha256(JSON.stringify(longObject))],
+    ['JSON 超过 255 字符的数组 → JSON 的 sha256', ['a'.repeat(300)], sha256(JSON.stringify(['a'.repeat(300)]))],
+    ['含控制字符的字符串 → sha256', 'C-1\n', sha256('C-1\n')],
+    ['恰好 255 字符的字符串 → 原样', 'z'.repeat(255), 'z'.repeat(255)],
+  ])('resource.id 超出服务端文本限制（≤ 255 字符、无控制字符）时改用哈希：%s', async (_label, value, expected) => {
+    const { agent, guard } = await setup({ resourceFromArg: 'target' });
+    guard.check.mockResolvedValue(ALLOW);
+
+    await agent.callTool({ name: 'echo', arguments: { target: value } });
+
+    expect(guard.check.mock.calls[0][0].resource).toEqual({ type: 'arg', id: expected });
+  });
+
+  it('每次调用使用新的幂等键：取自全局 crypto.randomUUID，不从 JSON-RPC id 派生', async () => {
+    const randomUUID = vi.spyOn(globalThis.crypto, 'randomUUID');
+    onTestFinished(() => randomUUID.mockRestore());
     const { agent, guard } = await setup();
     guard.check.mockResolvedValue(ALLOW);
 
@@ -423,6 +507,141 @@ describe('aster-guard-mcp 代理：Action 构造', () => {
     expect(keys[0]).toMatch(UUID);
     expect(keys[1]).toMatch(UUID);
     expect(keys[0]).not.toBe(keys[1]);
+    expect(randomUUID.mock.results.map((r) => r.value)).toEqual(expect.arrayContaining(keys));
+  });
+});
+
+describe('aster-guard-mcp 代理：上游超时与 progress 转发', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const hangingCall: UpstreamCall = () => new Promise<CallToolResult>(() => undefined);
+
+  /** 假上游先报告一次 progress（token 取上游请求里的 progressToken），再返回结果。 */
+  const reportsProgress: UpstreamCall = async (request, extra) => {
+    await extra.sendNotification({
+      method: 'notifications/progress',
+      params: { progressToken: request.params._meta?.progressToken ?? 'missing', progress: 1, total: 2, message: 'half' },
+    });
+    return { content: [{ type: 'text', text: 'done' }] };
+  };
+
+  it('上游超过 upstreamTimeoutMs 未响应 → 下游收到 RequestTimeout 错误，而不是成功结果', async () => {
+    const { agent, guard, upstreamCalls } = await setup({ upstreamTimeoutMs: 200 }, { call: hangingCall });
+    guard.check.mockResolvedValue(ALLOW);
+    useFakeClock();
+
+    const call = settledState(agent.callTool({ name: 'echo', arguments: {} }));
+    await flush();
+    expect(upstreamCalls).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(199);
+    expect(call.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(call.settled).toBe(true);
+    await expect(call.promise).rejects.toMatchObject({ code: ErrorCode.RequestTimeout, data: { timeout: 200 } });
+  });
+
+  it('upstreamTimeoutMs 缺省为 600000', async () => {
+    const { agent, guard } = await setup({}, { call: hangingCall });
+    guard.check.mockResolvedValue(ALLOW);
+    useFakeClock();
+
+    // agent 自己的请求超时放宽到 1 小时，确保先到时的是代理对上游的超时。
+    const call = settledState(agent.callTool({ name: 'echo', arguments: {} }, undefined, { timeout: 3_600_000 }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(599_999);
+    expect(call.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(call.settled).toBe(true);
+    await expect(call.promise).rejects.toMatchObject({ code: ErrorCode.RequestTimeout, data: { timeout: 600_000 } });
+  });
+
+  it.each([
+    ['tools/list 透传', (agent: Client) => agent.listTools()],
+    ['tools/call 前刷新工具名', (agent: Client) => agent.callTool({ name: 'echo', arguments: {} })],
+  ])('上游 tools/list 超过 upstreamTimeoutMs → %s 收到 RequestTimeout 错误', async (_label, act) => {
+    const { agent, guard } = await setup(
+      { upstreamTimeoutMs: 200 },
+      { list: () => new Promise<ListToolsResult>(() => undefined) },
+    );
+    useFakeClock();
+
+    const pending = settledState(act(agent));
+    await flush();
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(pending.settled).toBe(true);
+    await expect(pending.promise).rejects.toMatchObject({ code: ErrorCode.RequestTimeout, data: { timeout: 200 } });
+    expect(guard.check).not.toHaveBeenCalled();
+  });
+
+  it('上游在超时前报告 progress 会重置计时（resetTimeoutOnProgress）：总耗时超过 upstreamTimeoutMs 仍成功', async () => {
+    const slowWithProgress: UpstreamCall = async (request, extra) => {
+      await sleep(150);
+      await extra.sendNotification({
+        method: 'notifications/progress',
+        params: { progressToken: request.params._meta?.progressToken ?? 'missing', progress: 1 },
+      });
+      await sleep(150);
+      return { content: [{ type: 'text', text: 'done' }] };
+    };
+    const { agent, guard } = await setup({ upstreamTimeoutMs: 200 }, { call: slowWithProgress });
+    guard.check.mockResolvedValue(ALLOW);
+    useFakeClock();
+
+    const call = settledState(agent.callTool({ name: 'echo', arguments: {} }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(call.settled).toBe(true);
+    const result = await call.promise;
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toBe('done');
+  });
+
+  it('下游带 progressToken：上游 progress 以下游原 token 转发，下游 onprogress 收到', async () => {
+    const { agent, guard } = await setup({}, { call: reportsProgress });
+    guard.check.mockResolvedValue(ALLOW);
+    const onprogress = vi.fn();
+
+    const result = await agent.callTool({ name: 'echo', arguments: {} }, undefined, { onprogress });
+
+    expect(textOf(result)).toBe('done');
+    expect(onprogress).toHaveBeenCalledTimes(1);
+    expect(onprogress).toHaveBeenCalledWith({ progress: 1, total: 2, message: 'half' });
+  });
+
+  it('转发的 progressToken 与下游请求中的原值完全一致（字符串 token 亦然）', async () => {
+    const { agent, guard, agentNotifications } = await setup({}, { call: reportsProgress });
+    guard.check.mockResolvedValue(ALLOW);
+    // agent 没为 'tok-1' 登记回调，SDK 会经 onerror 报「未知 token」；这里只断言线上原文。
+    agent.onerror = () => undefined;
+
+    await agent.request(
+      { method: 'tools/call', params: { name: 'echo', arguments: {}, _meta: { progressToken: 'tok-1' } } },
+      CallToolResultSchema,
+    );
+
+    expect(agentNotifications).toEqual([
+      {
+        jsonrpc: '2.0',
+        method: 'notifications/progress',
+        params: { progressToken: 'tok-1', progress: 1, total: 2, message: 'half' },
+      },
+    ]);
+  });
+
+  it('下游未带 progressToken：上游 progress 不转发', async () => {
+    const { agent, guard, agentNotifications } = await setup({}, { call: reportsProgress });
+    guard.check.mockResolvedValue(ALLOW);
+
+    const result = await agent.callTool({ name: 'echo', arguments: {} });
+
+    expect(textOf(result)).toBe('done');
+    expect(agentNotifications).toEqual([]);
   });
 });
 
@@ -445,4 +664,14 @@ describe('createGuardProxyServer 参数校验', () => {
       createGuardProxyServer({ client: mockGuard() as unknown as GuardClientLike, principal: PRINCIPAL, approvalTimeoutMs: -1 }),
     ).toThrow(TypeError);
   });
+
+  // 上限是 setTimeout 的 32 位上限：超过时 Node 会把计时器改成 1 ms，等于每次上游调用立刻超时。
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31])(
+    'upstreamTimeoutMs 为 %s 属于编程错误，构造时抛出',
+    (upstreamTimeoutMs) => {
+      expect(() =>
+        createGuardProxyServer({ client: mockGuard() as unknown as GuardClientLike, principal: PRINCIPAL, upstreamTimeoutMs }),
+      ).toThrow(TypeError);
+    },
+  );
 });

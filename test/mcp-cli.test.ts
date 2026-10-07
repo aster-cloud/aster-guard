@@ -27,7 +27,19 @@ let guardServer: HttpServer;
 let baseUrl: string;
 const guardRequests: GuardRequest[] = [];
 
-/** mock guard：context.deny 为 true 时 DENY，否则 ALLOW。 */
+/** 与 aster-api GuardActionMapper 相同的 context 校验：含 null 值或序列化超过 65536 字节即 400 invalid_action。 */
+function contextViolation(context: unknown): string | undefined {
+  if (containsNull(context)) return 'context 不允许 null 值';
+  if (Buffer.byteLength(JSON.stringify(context ?? {})) > 65_536) return 'context 超过 65536 字节';
+  return undefined;
+}
+
+function containsNull(value: unknown): boolean {
+  if (value === null) return true;
+  return typeof value === 'object' && Object.values(value as object).some(containsNull);
+}
+
+/** mock guard：context 违反服务端限制时 400；context.deny 为 true 时 DENY，否则 ALLOW。 */
 beforeAll(async () => {
   guardServer = createServer((req, res) => {
     let raw = '';
@@ -36,6 +48,12 @@ beforeAll(async () => {
       const body = JSON.parse(raw || '{}') as GuardRequest['body'];
       guardRequests.push({ method: req.method ?? '', url: req.url ?? '', headers: req.headers, body });
       const context = (body.action?.context ?? {}) as Record<string, unknown>;
+      const violation = contextViolation(context);
+      if (violation) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid_action', message: violation }));
+        return;
+      }
       const decision =
         context.deny === true
           ? { decisionId: 'd-deny', outcome: 'DENY', effectiveOutcome: 'DENY', reason: 'blocked in test' }
@@ -150,6 +168,33 @@ describe('aster-guard-mcp CLI：端到端代理', { timeout: CLI_TEST_TIMEOUT_MS
           context: { text: 'hi' },
         },
       });
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it('工具参数里的 null 在 check 前被剔除，服务端校验通过而 ALLOW；上游收到原始参数；超大 context 被服务端拒绝', async () => {
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [CLI, ...requiredArgs(), '--upstream', UPSTREAM],
+      env: { PATH: process.env.PATH ?? '', ASTER_GUARD_API_KEY: 'ak_e2e' },
+      stderr: 'pipe',
+    });
+    const agent = new Client({ name: 'agent', version: '0.0.0' });
+    await agent.connect(transport);
+    try {
+      guardRequests.length = 0;
+      const allowed = await agent.callTool({ name: 'echo', arguments: { text: 'hi', note: null, tags: ['a', null] } });
+      expect(allowed.isError).toBeFalsy();
+      expect(allowed.content).toEqual([{ type: 'text', text: '{"text":"hi","note":null,"tags":["a",null]}' }]);
+      expect(guardRequests).toHaveLength(1);
+      expect(guardRequests[0].body.action.context).toEqual({ text: 'hi', tags: ['a'] });
+
+      const oversize = await agent.callTool({ name: 'echo', arguments: { text: 'x'.repeat(70_000) } });
+      expect(oversize.isError).toBe(true);
+      expect(oversize.content).toEqual([
+        { type: 'text', text: 'Blocked by Aster Guard: context 超过 65536 字节 (decision n/a)' },
+      ]);
     } finally {
       await agent.close();
     }

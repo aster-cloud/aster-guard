@@ -7,7 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { GuardClient } from '../client.js';
 import { VERSION } from '../index.js';
 import { ConfigError, parseCliArgs, upstreamEnv, USAGE, wantsHelp, type ProxyConfig } from './config.js';
-import { createGuardProxyServer } from './proxy.js';
+import { createGuardProxyServer, type GuardProxy } from './proxy.js';
 
 const NAME = 'aster-guard-mcp';
 
@@ -63,18 +63,39 @@ async function connectUpstream(
   return client;
 }
 
-/** 在 stdio 上提供代理服务，并接好生命周期：下游断开或收到信号 → 关闭上游后退出；上游意外断开 → 以 1 退出。 */
+/**
+ * 在 stdio 上提供代理服务。对下游的连接建立失败时，先关闭代理（含已启动的上游子进程）再抛出，
+ * 由入口以 1 退出——否则上游子进程要等到本进程退出、管道关闭后才结束。连接成功后才接好生命周期。
+ */
 async function serve(config: ProxyConfig, upstream: Client | undefined): Promise<void> {
   const { baseUrl, apiKey, policyModule, policyFunction, principal } = config;
+  const { approvalTimeoutMs, upstreamTimeoutMs, resourceFromArg, agentModel } = config;
   const proxy = createGuardProxyServer({
     client: new GuardClient({ baseUrl, apiKey, policyModule, policyFunction, principal }),
     upstream,
     principal,
-    approvalTimeoutMs: config.approvalTimeoutMs,
-    resourceFromArg: config.resourceFromArg,
-    agentModel: config.agentModel,
+    approvalTimeoutMs,
+    upstreamTimeoutMs,
+    resourceFromArg,
+    agentModel,
   });
 
+  try {
+    await proxy.server.connect(new StdioServerTransport());
+  } catch (e) {
+    await proxy.close().catch((closeError: unknown) => log(`关闭时出错：${errorMessage(closeError)}`));
+    throw e;
+  }
+  watchLifecycle(proxy, upstream);
+  log(
+    upstream
+      ? `${VERSION} 代理模式已启动，上游：${config.upstream?.command}`
+      : `${VERSION} 治理工具模式已启动（未指定 --upstream）`,
+  );
+}
+
+/** 生命周期：下游断开或收到信号 → 关闭上游后以 0 退出；上游意外断开 → 以 1 退出。 */
+function watchLifecycle(proxy: GuardProxy, upstream: Client | undefined): void {
   let closing = false;
   const shutdown = (code: number): void => {
     if (closing) return;
@@ -98,13 +119,6 @@ async function serve(config: ProxyConfig, upstream: Client | undefined): Promise
   process.stdin.once('end', () => shutdown(0));
   process.once('SIGINT', () => shutdown(0));
   process.once('SIGTERM', () => shutdown(0));
-
-  await proxy.server.connect(new StdioServerTransport());
-  log(
-    upstream
-      ? `${VERSION} 代理模式已启动，上游：${config.upstream?.command}`
-      : `${VERSION} 治理工具模式已启动（未指定 --upstream）`,
-  );
 }
 
 main(process.argv.slice(2)).catch((e: unknown) => {

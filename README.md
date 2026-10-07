@@ -88,10 +88,11 @@ switch (decision.effectiveOutcome) {
 
 stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 MCP 服务器：原样转发 `tools/list`，并拦截每一次 `tools/call`：
 
-1. 构造 Action：`action.name` 为工具名，`context` 为工具参数，`principal` 来自配置；指定 `--resource-from <argName>` 时，取该参数的值作为 `resource: { type: 'arg', id }`；`--agent-model` 写入 `agent.model`。
+1. 构造 Action：`action.name` 为工具名，`context` 为剔除 `null` 后的工具参数，`principal` 来自配置；指定 `--resource-from <argName>` 时，取该参数的值作为 `resource: { type: 'arg', id }`；`--agent-model` 写入 `agent.model`。规整规则见下文「服务端 Action 限制」。
 2. 以新的 UUID 作幂等键调用 `GuardClient.check`（每次调用一个新键，不从 JSON-RPC 请求 id 派生）。
-3. 只有服务端确认的 `ALLOW` 才转发给上游，上游结果原样返回；`DENY` 返回工具错误 `Blocked by Aster Guard: <reason> (decision <id>)`，guard 不可达时 decision 为 `n/a`；`PENDING` 则等待审批，最长 `--approval-timeout` 秒（默认 300），再按最终结论转发或拒绝。等待期间下游取消请求的，代理随即停止轮询，审批随后通过也不再转发。
-4. 上游没有的工具名返回 MCP 协议错误，不发起裁决。
+3. 只有服务端确认的 `ALLOW` 才转发给上游（原始参数），上游结果原样返回；`DENY` 返回工具错误 `Blocked by Aster Guard: <reason> (decision <id>)`，guard 不可达或请求被服务端拒绝时 decision 为 `n/a`；`PENDING` 则等待审批，最长 `--approval-timeout` 秒（默认 300），再按最终结论转发或拒绝。等待期间下游取消请求的，代理随即停止轮询，审批随后通过也不再转发。
+4. 转发后最长等待上游 `--upstream-timeout` 秒（默认 600），上游每报告一次 progress 重新计时；超时则下游收到 MCP 协议错误（`RequestTimeout`），不是工具结果。上游此时可能仍在执行，重试前先确认副作用是否已发生。
+5. 上游没有的工具名返回 MCP 协议错误，不发起裁决。
 
 > **宿主超时须覆盖审批等待。** MCP 宿主（客户端）给这次请求 / 工具调用设的超时必须不小于 `--approval-timeout`（MCP TypeScript SDK 的缺省请求超时只有 60 秒），否则就调低 `--approval-timeout`。不然 PENDING 的调用会先被宿主取消，审批即使通过也不会转发给上游。
 
@@ -115,12 +116,15 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 | `--upstream "<cmd> [args…]"` | 上游 MCP 服务器的启动命令，按 shell 规则切分（支持引号）；省略则为治理工具模式 |
 | `--api-key-env <name>` | 存放 API key 的环境变量名，默认 `ASTER_GUARD_API_KEY`；API key 只从环境变量读取 |
 | `--principal-type <type>` | 默认 `agent` |
-| `--principal-roles <a,b>` | 逗号分隔 |
+| `--principal-roles <a,b>` | 逗号分隔，至多 16 项 |
 | `--approval-timeout <seconds>` | 默认 300；宿主的请求 / 工具调用超时须不小于它（见上文） |
-| `--resource-from <argName>` | 以该工具参数的值作为 `resource.id` |
+| `--upstream-timeout <seconds>` | 正整数，默认 600；放行后等待上游工具返回的最长秒数，上游报告 progress 时重新计时 |
+| `--resource-from <argName>` | 以该工具参数的值作为 `resource.id`；过长或含控制字符时改用 `sha256:<hex>` |
 | `--agent-model <model>` | 写入 `action.agent.model` |
 
-上游子进程继承代理的环境变量，但不包含 API key 所在的那个变量。stdout 是 MCP 通道，日志一律写 stderr。退出码：`0` 正常结束（含 `--help`），`1` 上游无法启动或意外断开，`2` 参数错误。
+`--principal-id`、`--principal-type`、`--agent-model` 与每个角色须为 1–255 字符且不含控制字符，否则以参数错误退出（见下文「服务端 Action 限制」）。
+
+上游子进程继承代理的环境变量，但不包含 API key 所在的那个变量。stdout 是 MCP 通道，日志一律写 stderr。退出码：`0` 正常结束（含 `--help`），`1` 上游无法启动、意外断开或对下游的 stdio 通道建立失败（此时先关闭上游子进程），`2` 参数错误。
 
 Claude Desktop 配置示例（`claude_desktop_config.json`）：
 
@@ -187,6 +191,30 @@ Cursor 配置示例（项目级 `.cursor/mcp.json`，或全局 `~/.cursor/mcp.js
 > 宿主超时：上面两例的 `--approval-timeout 300`（秒）要求宿主对这个服务器的请求 / 工具调用超时不小于 300 秒，原因见上文「宿主超时须覆盖审批等待」；宿主超时调不了这么长时，把该值改成不超过宿主超时的秒数。
 >
 > `npx -y -p @aster-cloud/aster-guard aster-guard-mcp` 用 `-p` 指明要安装的包，再写要运行的命令名 `aster-guard-mcp`。不要写成 `npx -y @aster-cloud/aster-guard aster-guard-mcp …`：命令名会被当作多余的位置参数而报错（退出码 2）。全局安装后也可直接把 `command` 写成 `aster-guard-mcp`，`args` 去掉前四项。`--base-url` 换成实际的 aster-api 地址；`ASTER_GUARD_API_KEY` 是请求方的 API key。
+
+## 服务端 Action 限制
+
+aster-api 在裁决前校验 Action（`GuardActionMapper`），不合规的请求整体返回 400 `invalid_action`，不产生决策：
+
+| 字段 | 限制 |
+|---|---|
+| `principal.id`、`principal.type`、`action.name`、`resource.type`、`resource.id`、`agent.model` | ≤ 255 字符（按 UTF-16 码元计），不含控制字符（U+0000–U+001F、U+007F–U+009F） |
+| `principal.roles` | ≤ 16 项，每项同上 |
+| `context` | 嵌套深度 ≤ 8，序列化后 ≤ 65536 字节，**不允许 `null` 值**（嵌套对象与数组里的也不行） |
+
+`GuardClient.check` 收到这种 400 时返回 `decisionId: ''`、`reasonCode: 'http_400'`、`reason` 为服务端 message 的 DENY。代理据此拒绝这次工具调用，文本形如：
+
+```text
+Blocked by Aster Guard: <服务端 message> (decision n/a)
+例：Blocked by Aster Guard: context 不允许 null 值 (decision n/a)
+```
+
+为免常见输入被整体拒绝，代理在 `check` 前做两处规整（只作用于提交给 guard 的 Action，转发给上游的仍是原始参数）：
+
+- **剔除 `null`**：宿主与模型常用 `null` 表示「未提供的可选参数」。代理递归剔除 `context` 中值为 `null` 的键与数组里的 `null` 元素；对规则而言 `null` 与缺省等价。
+- **哈希资源 id**：`--resource-from` 取到的值（字符串，或对象 / 数组的 JSON）超过 255 字符或含控制字符时，`resource.id` 改为 `sha256:<64 位十六进制>`，同一个值总得到同一个 id。
+
+`--principal-id`、`--principal-type`、`--agent-model` 与 `--principal-roles` 各项在启动时按上表校验，违反即以退出码 2 结束，而不是让每一次调用都被拒绝。`context` 的深度与大小代理不做改写：超出时（例如给文件写入工具传入超过 64 KB 的内容）调用会以上述文本被拒绝。
 
 ## 本地端到端
 
