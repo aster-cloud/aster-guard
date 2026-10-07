@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer, type IncomingMessage, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -6,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { runNode, UUID } from './helpers.js';
 
 // CLI 端到端：以子进程运行构建产物 dist/mcp/cli.js（由 pnpm test 先 build 保证），
 // 上游为 test/fixtures/echo-upstream.mjs，guard 为本地 mock HTTP 服务（ADR 0040 §6、§8）。
@@ -14,7 +14,6 @@ const CLI = fileURLToPath(new URL('../dist/mcp/cli.js', import.meta.url));
 const FIXTURE = fileURLToPath(new URL('./fixtures/echo-upstream.mjs', import.meta.url));
 const UPSTREAM = `"${process.execPath}" "${FIXTURE}"`;
 const CLI_TEST_TIMEOUT_MS = 15_000;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 interface GuardRequest {
   method: string;
@@ -67,32 +66,17 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  guardServer.close();
+  guardServer.closeAllConnections();
+  await new Promise<void>((resolve) => guardServer.close(() => resolve()));
 });
 
 function requiredArgs(): string[] {
   return ['--base-url', baseUrl, '--policy', 'guard.test/decide', '--principal-id', 'agent-e2e'];
 }
 
-/**
- * 运行 CLI 直到退出。stdin 的关闭时机：'now' 立即关闭；RegExp 在 stderr 匹配后关闭；'never' 保持打开
- * （用于验证非 stdin 触发的退出路径）。
- */
-async function runCli(args: string[], env: NodeJS.ProcessEnv = {}, closeStdin: 'now' | 'never' | RegExp = 'now') {
-  const child = spawn(process.execPath, [CLI, ...args], { env: { PATH: process.env.PATH, ...env } });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (chunk) => (stdout += chunk));
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk;
-    if (closeStdin instanceof RegExp && closeStdin.test(stderr)) child.stdin.end();
-  });
-  if (closeStdin === 'now') child.stdin.end();
-  // 兜底：CLI 卡住时杀掉子进程，让断言失败而不是留下孤儿进程。
-  const killer = setTimeout(() => child.kill('SIGKILL'), CLI_TEST_TIMEOUT_MS - 1_000);
-  const [code] = (await once(child, 'exit')) as [number | null];
-  clearTimeout(killer);
-  return { code, stdout, stderr };
+/** 运行 CLI 直到其 stdio 全部关闭；stdin 关闭时机见 runNode。 */
+function runCli(args: string[], env: NodeJS.ProcessEnv = {}, closeStdin: 'now' | 'never' | RegExp = 'now') {
+  return runNode(CLI, args, env, { closeStdin, killAfterMs: CLI_TEST_TIMEOUT_MS - 1_000 });
 }
 
 describe('aster-guard-mcp CLI：参数', { timeout: CLI_TEST_TIMEOUT_MS }, () => {

@@ -40,7 +40,9 @@ const nonEmpty = (what: string) => z.string().min(1).describe(what);
 const businessRole = z
   .string()
   .optional()
-  .describe("Approver's business role, matched exactly against the rule's required role (sent as X-User-Business-Role)");
+  .describe(
+    "Approver's business role, matched exactly against the rule's required role (sent as the X-User-Business-Role header, so Latin-1 characters only)",
+  );
 
 const TOOLS = {
   guard_check: defineTool(

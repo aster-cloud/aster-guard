@@ -1,9 +1,9 @@
-import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer, type IncomingMessage, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { runNode } from './helpers.js';
 
 // scripts/e2e-local.mjs 的行为测试：脚本面向真实 aster-api，这里用本地 mock HTTP 服务代替，
 // 验证参数契约、成功路径、SKIP 路径，以及断言失败时确实以非零码退出（确定性，不依赖外部网络）。
@@ -50,23 +50,15 @@ beforeEach(async () => {
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 
-afterEach(() => {
-  server.close();
+afterEach(async () => {
+  // 先断开脚本留下的 keep-alive 连接，否则 close 要等它们超时才回调。
+  server.closeAllConnections();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
 /** 以最小环境运行脚本（不继承父进程的 ASTER_GUARD_*），返回退出码与输出。 */
-async function runScript(env: NodeJS.ProcessEnv) {
-  const child = spawn(process.execPath, [SCRIPT], { env: { PATH: process.env.PATH, ...env } });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (chunk) => (stdout += chunk));
-  child.stderr.on('data', (chunk) => (stderr += chunk));
-  child.stdin.end();
-  // 兜底：脚本卡住时杀掉子进程，让断言失败而不是留下孤儿进程。
-  const killer = setTimeout(() => child.kill('SIGKILL'), SCRIPT_TEST_TIMEOUT_MS - 1_000);
-  const [code] = (await once(child, 'exit')) as [number | null];
-  clearTimeout(killer);
-  return { code, stdout, stderr };
+function runScript(env: NodeJS.ProcessEnv) {
+  return runNode(SCRIPT, [], env, { killAfterMs: SCRIPT_TEST_TIMEOUT_MS - 1_000 });
 }
 
 const allow = (decisionId: string): Reply => ({
@@ -95,6 +87,30 @@ describe('scripts/e2e-local.mjs', { timeout: SCRIPT_TEST_TIMEOUT_MS }, () => {
     expect(requests).toHaveLength(0);
   });
 
+  it('ASTER_GUARD_API_KEY 只有空白 → 视为未设置：用法写 stderr，退出码 2，且不发任何请求', async () => {
+    const { code, stdout, stderr } = await runScript({ ASTER_GUARD_BASE_URL: baseUrl, ASTER_GUARD_API_KEY: ' \t ' });
+    expect(code).toBe(2);
+    expect(stdout).toBe('');
+    expect(stderr).toContain('缺少必填环境变量 ASTER_GUARD_API_KEY');
+    expect(stderr).toContain('用法');
+    expect(requests).toHaveLength(0);
+  });
+
+  it('其余变量去掉首尾空白，只有空白时取缺省值：缺省策略、审批步骤 SKIP', async () => {
+    checkReplies = [allow('d-read'), pending('d-delete', 'ap-1')];
+    const { code, stdout } = await runScript({
+      ASTER_GUARD_BASE_URL: ` ${baseUrl} `,
+      ASTER_GUARD_API_KEY: ' ak_req ',
+      ASTER_GUARD_POLICY: '   ',
+      ASTER_GUARD_APPROVER_API_KEY: ' ',
+    });
+    expect(code).toBe(0);
+    expect(stdout).toContain('SKIP: 审批步骤需要第二把 API key');
+    expect(requests).toHaveLength(2);
+    expect(requests[0].headers.authorization).toBe('Bearer ak_req');
+    expect(requests[0].body).toMatchObject({ policyModule: 'guard.customer', policyFunction: 'decide' });
+  });
+
   it('ASTER_GUARD_POLICY 不是 <module>/<function> → 用法写 stderr，退出码 2', async () => {
     const { code, stdout, stderr } = await runScript({
       ASTER_GUARD_BASE_URL: baseUrl,
@@ -116,6 +132,8 @@ describe('scripts/e2e-local.mjs', { timeout: SCRIPT_TEST_TIMEOUT_MS }, () => {
     expect(stdout).toContain('✗');
     expect(stdout).toContain('"decisionId": "d-delete"');
     expect(stdout).toContain('blocked in test');
+    // 失败标签本身写出实际的 effectiveOutcome，不必在 JSON 里找。
+    expect(stdout).toMatch(/✗ \[2\] delete_customer_record → PENDING（实际 DENY，approvalId 缺失）/);
     // 断言失败后不再进入审批步骤。
     expect(requests.map((r) => r.url)).toEqual(['/api/v1/guard/decisions', '/api/v1/guard/decisions']);
   });

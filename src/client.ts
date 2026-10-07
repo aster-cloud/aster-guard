@@ -45,9 +45,9 @@ interface ExchangeRequest {
  * Action Guard 客户端（ADR 0040 §6）。
  *
  * fail-closed：check / get / waitFor 对任何非 2xx、网络错误、响应体不合契约或超时都返回
- * effectiveOutcome 为 DENY 的决策，**从不抛异常**——抛异常会让调用方在 catch 里误放行。
+ * effectiveOutcome 为 DENY 的决策，**对 guard 结果从不抛异常**——抛异常会让调用方在 catch 里误放行。
  * 审批操作（listApprovals / approve / reject）不是 guard 结论，返回带错误码的 `{ ok: false }`，同样不抛异常。
- * 只有编程错误（缺 baseUrl / apiKey 等配置）在构造时抛出。
+ * 只有编程错误才抛 TypeError：构造时缺 baseUrl / apiKey 等配置，或调用 waitFor 时选项非法。
  */
 export class GuardClient {
   private readonly baseUrl: string;

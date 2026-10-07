@@ -19,6 +19,7 @@ import {
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { createGuardProxyServer, type GuardClientLike, type GuardProxyOptions } from '../src/mcp/index.js';
 import type { GuardDecision } from '../src/types.js';
+import { mockGuard, textOf, UUID } from './helpers.js';
 
 // 代理集成测试：内存 MCP 上游（假服务器）+ mock GuardClient + SDK Client（ADR 0040 §6）。
 // 链路：agent Client ⇄ InMemory ⇄ 代理 Server ⇄（upstream Client ⇄ InMemory ⇄ 假上游 Server）。
@@ -46,19 +47,6 @@ const PENDING: GuardDecision = {
   effectiveOutcome: 'PENDING',
   approval: { id: 'a-3', status: 'PENDING', expiresAt: '2026-10-09T00:00:00Z', requiredRole: 'DPO' },
 };
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-function mockGuard() {
-  return {
-    check: vi.fn<GuardClientLike['check']>(),
-    get: vi.fn<GuardClientLike['get']>(),
-    waitFor: vi.fn<GuardClientLike['waitFor']>(),
-    listApprovals: vi.fn<GuardClientLike['listApprovals']>(),
-    approve: vi.fn<GuardClientLike['approve']>(),
-    reject: vi.fn<GuardClientLike['reject']>(),
-  };
-}
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -146,19 +134,26 @@ function useFakeClock(): void {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-function textOf(result: Awaited<ReturnType<Client['callTool']>>): string {
-  const content = result.content as Array<{ type: string; text?: string }>;
-  expect(content).toHaveLength(1);
-  expect(content[0].type).toBe('text');
-  return content[0].text ?? '';
-}
-
 describe('aster-guard-mcp 代理：tools/list', () => {
   it('原样透传上游工具列表', async () => {
     const { agent, guard } = await setup();
     const { tools } = await agent.listTools();
     expect(tools).toEqual(UPSTREAM_TOOLS);
     expect(guard.check).not.toHaveBeenCalled();
+  });
+
+  it('下游带 cursor：cursor 原样到达上游，上游的 nextCursor 原样返回', async () => {
+    const pages: Record<string, ListToolsResult> = {
+      first: { tools: [UPSTREAM_TOOLS[0]], nextCursor: 'opaque/p2' },
+      'opaque/p2': { tools: [UPSTREAM_TOOLS[1]], nextCursor: 'opaque/p3' },
+    };
+    const { agent, upstreamListCalls } = await setup({}, { list: (cursor) => pages[cursor ?? 'first'] });
+
+    const result = await agent.listTools({ cursor: 'opaque/p2' });
+
+    expect(result.tools).toEqual([UPSTREAM_TOOLS[1]]);
+    expect(result.nextCursor).toBe('opaque/p3');
+    expect(upstreamListCalls.mock.calls.map(([cursor]) => cursor)).toEqual(['opaque/p2']);
   });
 });
 

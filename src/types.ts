@@ -138,13 +138,18 @@ export interface GuardWaitOptions {
 /** `approve` 的选项。 */
 export interface GuardApproveOptions {
   comment?: string;
-  /** 审批人的业务角色，作为 `X-User-Business-Role` 头发送，与规则的 required role 精确比对。 */
+  /**
+   * 审批人的业务角色，作为 `X-User-Business-Role` 头发送，与规则的 required role 精确比对。
+   * HTTP 头只能携带 Latin-1 字符：非 Latin-1 的角色名（如中文）会被 fetch 在发出前拒绝，
+   * 结果为 `{ ok: false, status: 0, error: 'client_error' }`。
+   */
   businessRole?: string;
 }
 
 /** `reject` 的选项：comment 必填。 */
 export interface GuardRejectOptions {
   comment: string;
+  /** 同 {@link GuardApproveOptions.businessRole}：仅限 Latin-1 字符。 */
   businessRole?: string;
 }
 

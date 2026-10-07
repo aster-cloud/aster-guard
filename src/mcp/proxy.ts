@@ -248,7 +248,7 @@ function resourceIdText(value: unknown): string {
  * 下游取消后 waitFor 随之停止轮询。
  *
  * 每次 tools/call 用新的 UUID 作幂等键：键只代表这一次动作尝试，绝不从 JSON-RPC 请求 id 派生——
- * 后者在重连或换会话后会重复，让不同动作撞键（§6）。GuardClient 约定不抛异常；注入的实现若抛出，
+ * 后者在重连或换会话后会重复，让不同动作撞键（§6）。GuardClient 约定对 guard 结果不抛异常；注入的实现若抛出，
  * 同样按 fail-closed 处理为 DENY，并保留已知的 PENDING decisionId 便于追查。
  */
 async function decide(options: ResolvedOptions, action: GuardAction, signal: AbortSignal): Promise<GuardDecision> {

@@ -1,8 +1,9 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { createGuardProxyServer, type GuardClientLike } from '../src/mcp/index.js';
 import type { GuardDecision } from '../src/types.js';
+import { mockGuard, textOf } from './helpers.js';
 
 // 无上游时的五个治理工具：一一对应 GuardClient 方法，结果以 JSON 文本返回（ADR 0040 §6）。
 
@@ -10,17 +11,6 @@ const PRINCIPAL = { id: 'agent-42', type: 'agent' };
 
 const ALLOW: GuardDecision = { decisionId: 'd-1', outcome: 'ALLOW', effectiveOutcome: 'ALLOW' };
 const DENY: GuardDecision = { decisionId: 'd-2', outcome: 'DENY', effectiveOutcome: 'DENY', reasonCode: 'policy_denied' };
-
-function mockGuard() {
-  return {
-    check: vi.fn<GuardClientLike['check']>(),
-    get: vi.fn<GuardClientLike['get']>(),
-    waitFor: vi.fn<GuardClientLike['waitFor']>(),
-    listApprovals: vi.fn<GuardClientLike['listApprovals']>(),
-    approve: vi.fn<GuardClientLike['approve']>(),
-    reject: vi.fn<GuardClientLike['reject']>(),
-  };
-}
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -40,14 +30,6 @@ async function setup(agentModel?: string) {
     await proxy.close();
   });
   return { agent, guard };
-}
-
-/** 取唯一一段文本内容。 */
-function textOf(result: Awaited<ReturnType<Client['callTool']>>): string {
-  const content = result.content as Array<{ type: string; text?: string }>;
-  expect(content).toHaveLength(1);
-  expect(content[0].type).toBe('text');
-  return content[0].text ?? '';
 }
 
 describe('治理工具：tools/list', () => {

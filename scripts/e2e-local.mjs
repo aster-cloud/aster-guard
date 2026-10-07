@@ -37,9 +37,9 @@ class StepFailure extends Error {
   }
 }
 
-/** 读取环境变量；空串视为未设置。 */
+/** 读取环境变量并去掉首尾空白；空串或纯空白视为未设置（必填项因此走用法提示与退出码 2）。 */
 function env(name, fallback) {
-  return process.env[name] || fallback;
+  return process.env[name]?.trim() || fallback;
 }
 
 /** 解析配置；参数错误时返回 undefined 并已把原因写到 stderr。 */
@@ -91,7 +91,7 @@ async function run(config) {
   const approvalId = del.approval?.id;
   expectStep(
     del.effectiveOutcome === 'PENDING' && typeof approvalId === 'string' && approvalId !== '',
-    `[2] delete_customer_record → PENDING（需 approvalId，实际 ${approvalId ?? '缺失'}）`,
+    `[2] delete_customer_record → PENDING（实际 ${del.effectiveOutcome}，approvalId ${approvalId ?? '缺失'}）`,
     del,
   );
 

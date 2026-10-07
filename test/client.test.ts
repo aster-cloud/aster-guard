@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GuardClient, type GuardClientOptions, type GuardDecision } from '../src/index.js';
+import { UUID } from './helpers.js';
 
 // 单元测试：注入 vi.fn() 作为 fetch，不发真实网络请求（ADR 0040 §6）。
 
@@ -103,9 +104,8 @@ describe('GuardClient.check', () => {
 
     const k1 = request(fetchMock, 0).headers.get('Idempotency-Key');
     const k2 = request(fetchMock, 1).headers.get('Idempotency-Key');
-    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-    expect(k1).toMatch(uuid);
-    expect(k2).toMatch(uuid);
+    expect(k1).toMatch(UUID);
+    expect(k2).toMatch(UUID);
     expect(k1).not.toBe(k2);
   });
 
@@ -154,32 +154,50 @@ describe('GuardClient.check', () => {
     await expect(client(fetchMock).check(ACTION)).resolves.toMatchObject(deny('client_error'));
   });
 
-  it('超时（fetch 等待 AbortSignal）→ DENY client_timeout', async () => {
-    const fetchMock = vi.fn(
-      (_url: string, init: RequestInit) =>
-        new Promise<Response>((_resolve, reject) => {
-          init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
-        }),
-    );
-    const d = await client(fetchMock, { timeoutMs: 20 }).check(ACTION);
-    expect(d).toMatchObject(deny('client_timeout'));
-    expect(request(fetchMock).headers.get('Idempotency-Key')).toBeTruthy();
-    expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
-  });
+  describe('超时（假定时器）', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
 
-  it('fetch 忽略 AbortSignal 永不返回时同样按时 DENY client_timeout，且仍中止请求', async () => {
-    const fetchMock = vi.fn<typeof fetch>(() => new Promise<Response>(() => undefined));
-    await expect(client(fetchMock, { timeoutMs: 20 }).check(ACTION)).resolves.toMatchObject(deny('client_timeout'));
-    expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
-  });
-
-  describe('默认超时', () => {
     afterEach(() => {
       vi.useRealTimers();
     });
 
+    it('超时（fetch 等待 AbortSignal）→ DENY client_timeout', async () => {
+      const fetchMock = vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          }),
+      );
+      const pending = client(fetchMock, { timeoutMs: 20 }).check(ACTION);
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(await pending).toMatchObject(deny('client_timeout'));
+      expect(request(fetchMock).headers.get('Idempotency-Key')).toBeTruthy();
+      expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
+    });
+
+    it('fetch 忽略 AbortSignal 永不返回时同样按时 DENY client_timeout，且仍中止请求', async () => {
+      const fetchMock = vi.fn<typeof fetch>(() => new Promise<Response>(() => undefined));
+      const pending = client(fetchMock, { timeoutMs: 20 }).check(ACTION);
+      await vi.advanceTimersByTimeAsync(20);
+
+      await expect(pending).resolves.toMatchObject(deny('client_timeout'));
+      expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
+    });
+
+    it('waitSeconds 让服务端等待时，客户端超时相应延长', async () => {
+      const fetchMock = vi.fn(
+        () => new Promise<Response>((resolve) => setTimeout(() => resolve(json(200, ALLOW)), 60)),
+      );
+      const pending = client(fetchMock, { timeoutMs: 20 }).check(ACTION, { waitSeconds: 1 });
+      await vi.advanceTimersByTimeAsync(60);
+
+      await expect(pending).resolves.toEqual(ALLOW);
+    });
+
     it('默认单次超时为 12000 ms（服务端评估超时 10 秒另留余量）', async () => {
-      vi.useFakeTimers();
       const fetchMock = vi.fn<typeof fetch>(() => new Promise<Response>(() => undefined));
       let result: GuardDecision | undefined;
       void client(fetchMock).check(ACTION).then((d) => {
@@ -192,13 +210,6 @@ describe('GuardClient.check', () => {
       expect(result).toMatchObject(deny('client_timeout'));
       expect((fetchMock.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
     });
-  });
-
-  it('waitSeconds 让服务端等待时，客户端超时相应延长', async () => {
-    const fetchMock = vi.fn(
-      () => new Promise<Response>((resolve) => setTimeout(() => resolve(json(200, ALLOW)), 60)),
-    );
-    await expect(client(fetchMock, { timeoutMs: 20 }).check(ACTION, { waitSeconds: 1 })).resolves.toEqual(ALLOW);
   });
 
   it('既无 action.principal 也无配置 principal → DENY client_error，不发请求', async () => {
@@ -432,6 +443,16 @@ describe('GuardClient 审批', () => {
     expect(req.headers.get('Authorization')).toBe('Bearer ak_test');
     expect(req.body).toEqual({ comment: 'ok' });
     expect(r).toEqual({ ok: true, decision: APPROVED });
+  });
+
+  it('businessRole 含非 Latin-1 字符（如中文角色名）→ Node fetch 拒绝该请求头，返回 client_error，不抛异常', async () => {
+    // 不注入 fetch：头部取值校验发生在内置 fetch 构造请求时，早于任何网络连接。
+    const guard = new GuardClient({ ...BASE_OPTIONS, baseUrl: 'http://127.0.0.1:9' });
+
+    const r = await guard.approve('a-1', { businessRole: '数据保护官' });
+
+    expect(r).toMatchObject({ ok: false, status: 0, error: 'client_error' });
+    expect(r.ok ? '' : r.message).toMatch(/ByteString/);
   });
 
   it('approve 不带参数时发送空对象且不带业务角色头', async () => {

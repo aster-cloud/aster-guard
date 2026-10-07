@@ -77,12 +77,12 @@ switch (decision.effectiveOutcome) {
 | `get(decisionId)` | `GET /api/v1/guard/decisions/{id}`，读取当前状态 |
 | `waitFor(decisionId, { timeoutMs = 300000, intervalMs = 2000, signal? })` | 轮询直到服务端给出非 PENDING 结论；瞬时失败（网络、超时、5xx、429）继续轮询，其他失败立即返回 DENY；到时返回 DENY `wait_timeout`；`signal` 中止后返回 DENY `wait_aborted`。三者都保留 decisionId |
 | `listApprovals(status = 'PENDING', page = 0, size = 20)` | `GET /api/v1/guard/approvals`，返回 `{ ok: true, items, page, size }` 或 `{ ok: false, … }` |
-| `approve(id, { comment?, businessRole? })` | `POST /api/v1/guard/approvals/{id}/approve`；`businessRole` 作为 `X-User-Business-Role` 头发送 |
-| `reject(id, { comment, businessRole? })` | `POST /api/v1/guard/approvals/{id}/reject`；`comment` 必填，缺失时客户端直接返回 `comment_required` |
+| `approve(id, { comment?, businessRole? })` | `POST /api/v1/guard/approvals/{id}/approve`；`businessRole` 作为 `X-User-Business-Role` 头发送。HTTP 头只能携带 Latin-1 字符，非 Latin-1 的角色名（如中文）会在发出前被拒绝，得到 `{ ok: false, status: 0, error: 'client_error' }` |
+| `reject(id, { comment, businessRole? })` | `POST /api/v1/guard/approvals/{id}/reject`；`comment` 必填，缺失时客户端直接返回 `comment_required`；`businessRole` 同 `approve`（仅限 Latin-1 字符） |
 
 `effectiveOutcome` 是调用方唯一需要看的字段：`ALLOW` 才可执行；`DENY` 不执行；`PENDING` 继续轮询。
 
-`check` / `get` / `waitFor` 从不抛异常。客户端无法确认结论时返回 `decisionId: ''`、`effectiveOutcome: 'DENY'` 的决策，`reasonCode` 为：`http_<status>`（非 2xx）、`idempotency_mismatch`（422）、`client_error`（网络错误、响应体不合契约）、`client_timeout`（单次请求超时，默认 12 秒，为服务端 10 秒评估超时留出余量，`timeoutMs` 可配；带 `waitSeconds` 时自动延长）。审批操作不是 guard 结论，失败时返回 `{ ok: false, status, error, message }`，`error` 为服务端错误码（如 `segregation_of_duties`）；未收到 HTTP 响应时 `status` 为 0。
+`check` / `get` / `waitFor` 对 guard 结果从不抛异常；`waitFor` 的非法选项（如负的 `timeoutMs`）属于编程错误，抛 `TypeError`。客户端无法确认结论时返回 `decisionId: ''`、`effectiveOutcome: 'DENY'` 的决策，`reasonCode` 为：`http_<status>`（非 2xx）、`idempotency_mismatch`（422）、`client_error`（网络错误、响应体不合契约）、`client_timeout`（单次请求超时，默认 12 秒，为服务端 10 秒评估超时留出余量，`timeoutMs` 可配；带 `waitSeconds` 时自动延长）。审批操作不是 guard 结论，失败时返回 `{ ok: false, status, error, message }`，`error` 为服务端错误码（如 `segregation_of_duties`）；未收到 HTTP 响应时 `status` 为 0。
 
 ## aster-guard-mcp
 
@@ -96,6 +96,16 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 
 > **宿主超时须覆盖审批等待。** MCP 宿主（客户端）给这次请求 / 工具调用设的超时必须不小于 `--approval-timeout`（MCP TypeScript SDK 的缺省请求超时只有 60 秒），否则就调低 `--approval-timeout`。不然 PENDING 的调用会先被宿主取消，审批即使通过也不会转发给上游。
 
+### 转发范围
+
+代理只代理 tools，不是全透明的 MCP 代理：
+
+- `tools/list` 原样转发（含 `cursor` / `nextCursor`、`annotations`、`_meta`）；`tools/call` 先裁决、放行后再转发。
+- 上游的 `notifications/progress` 只在下游这次 `tools/call` 带了 `_meta.progressToken` 时，以下游的原 token 转发；没带则丢弃（但仍会重置上游超时计时）。
+- 不转发 resources、prompts 及其他能力，也不转发上游的 `notifications/tools/list_changed`（代理未声明 `tools.listChanged`）；上游工具集变化后，下游需重新 `tools/list`。
+
+### 治理工具模式
+
 不指定上游时，只提供五个治理工具，供人机协作场景使用。结果是 JSON 文本，`DENY` 或 `ok: false` 时标记 `isError`：
 
 | 工具 | 对应方法 | 参数 |
@@ -103,10 +113,12 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 | `guard_check` | `check` | `action: { name }`、`resource?`、`context?`、`waitSeconds?`（主体与模型来自配置，参数不能改写） |
 | `guard_status` | `get` | `decisionId` |
 | `guard_list_approvals` | `listApprovals` | `status?`、`page?`、`size?` |
-| `guard_approve` | `approve` | `approvalId`、`comment?`、`businessRole?` |
-| `guard_reject` | `reject` | `approvalId`、`comment`（必填）、`businessRole?` |
+| `guard_approve` | `approve` | `approvalId`、`comment?`、`businessRole?`（仅限 Latin-1 字符，见上文 `approve`） |
+| `guard_reject` | `reject` | `approvalId`、`comment`（必填）、`businessRole?`（同上） |
 
-命令行参数（完整说明见 `aster-guard-mcp --help`）：
+### 命令行参数
+
+完整说明见 `aster-guard-mcp --help`。
 
 | 参数 | 说明 |
 |---|---|
@@ -127,6 +139,8 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 上游子进程继承代理的环境变量，但不包含 API key 所在的那个变量。stdout 是 MCP 通道，日志一律写 stderr。退出码：`0` 正常结束（含 `--help`），`1` 上游无法启动、意外断开或对下游的 stdio 通道建立失败（此时先关闭上游子进程），`2` 参数错误。
 
 要在宿主侧程序里嵌入代理（自行提供 transport 与已连接的上游 `Client`），可从子路径导入：`import { createGuardProxyServer } from '@aster-cloud/aster-guard/mcp'`，选项与 CLI 参数一一对应（`approvalTimeoutMs`、`upstreamTimeoutMs`、`resourceFromArg`、`agentModel`）。
+
+### 客户端配置
 
 Claude Desktop 配置示例（`claude_desktop_config.json`）：
 
@@ -276,7 +290,7 @@ node scripts/e2e-local.mjs
 | 3 | 审批方 `approve(approvalId, { comment: 'e2e', businessRole })` | 返回 `ok: true` |
 | 4 | 请求方 `get(decisionId)` | `effectiveOutcome` 变为 `ALLOW` |
 
-每步输出一行 `✓` 或 `✗`。任一断言失败时，脚本打印完整的决策（或审批结果）JSON 并以退出码 1 结束；缺少 `ASTER_GUARD_API_KEY` 或 `ASTER_GUARD_POLICY` 格式不对时，用法写到 stderr，退出码 2。
+每步输出一行 `✓` 或 `✗`（步骤 2 的标签写出实际的 `effectiveOutcome`）。任一断言失败时，脚本打印完整的决策（或审批结果）JSON 并以退出码 1 结束；缺少 `ASTER_GUARD_API_KEY` 或 `ASTER_GUARD_POLICY` 格式不对时，用法写到 stderr，退出码 2。环境变量的值会去掉首尾空白，只有空白等同于未设置。
 
 未设置 `ASTER_GUARD_APPROVER_API_KEY` 时，步骤 3、4 不执行，脚本输出 `SKIP: 审批步骤需要第二把 API key (ASTER_GUARD_APPROVER_API_KEY)`，仍以退出码 0 结束（只覆盖了步骤 1、2）。此时步骤 2 产生的待审批记录会留在 aster-api，可用 `guard_list_approvals` / `listApprovals` 查看，或等它过期。
 
