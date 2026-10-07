@@ -9,7 +9,7 @@ AI Agent 在执行有副作用的动作之前（删除客户记录、转账、�
 - **`GuardClient`**：调用 aster-api `/api/v1/guard/*` 的 TypeScript SDK。
 - **`aster-guard-mcp`**：stdio MCP 代理。包在任意上游 MCP 服务器外面，对每一次 `tools/call` 先过 guard，再决定是否转发。
 
-设计依据见 aster-api 仓库的 [ADR 0040：Action Guard](https://github.com/aster-cloud/aster-api/blob/main/docs/adr/0040-action-guard.md)（本包对应 §6）。
+设计依据见 aster-api 仓库 `docs/adr/0040-action-guard.md`（ADR 0040：Action Guard，本包对应 §6），随子项目 2 合并后可见。
 
 > **当前状态：脚手架（0.1.0）。** 仓库、工具链与 CI/发布流程已就绪，`src/index.ts` 目前只导出 `VERSION`。下文标注「实现于后续任务」的章节描述的是设计目标，尚不可用。
 
@@ -118,7 +118,7 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）。参数与环境�
 
 > 包只有一个可执行文件 `aster-guard-mcp`，`npx` 会直接运行它；全局安装后也可把 `command` 写成 `aster-guard-mcp`。`policyModule`、`policyFunction` 与 `principal` 同样由配置提供，不在示例中展开。
 
-## fail-closed 语义
+## fail-closed 语义（设计约束，随实现任务落地）
 
 守门失效不能等于放行。客户端与代理遵守同一条规则：
 
@@ -129,7 +129,7 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）。参数与环境�
 
 这些是安全属性，不是可调参数：任何改动都不得把「无法确认」解释为放行。
 
-## 幂等键策略
+## 幂等键策略（设计约束，随实现任务落地）
 
 `POST /api/v1/guard/decisions` 通过 `Idempotency-Key` 头去重。SDK 与代理统一遵守：
 
@@ -144,7 +144,7 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）。参数与环境�
 pnpm install
 pnpm run typecheck   # tsc --noEmit，仅覆盖 src
 pnpm run lint        # eslint src test
-pnpm test            # vitest run
+pnpm test            # 先 build，再 vitest run（含 dist 入口测试）
 pnpm run build       # tsc → dist/
 ```
 

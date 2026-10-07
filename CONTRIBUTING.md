@@ -14,7 +14,7 @@
 pnpm install
 pnpm run typecheck   # 类型检查（仅 src）
 pnpm run lint        # ESLint（src + test）
-pnpm test            # vitest
+pnpm test            # 先 build，再 vitest run（含 dist 入口测试）
 pnpm run build       # tsc 构建到 dist/
 ```
 

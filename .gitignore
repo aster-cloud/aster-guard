@@ -1,4 +1,51 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器 / IDE
+.idea/
+.intellij/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.vscode-test/
+
+# AI 助手 / Agent 会话数据与本地任务状态（不属于源码）
+.claude/
+**/.claude/
+.codex/
+**/.codex/
+.shrimp/
+**/.shrimp/
+.ccg/
+
+# Node / TypeScript
 node_modules/
 dist/
 coverage/
-.DS_Store
+.nyc_output/
+*.tsbuildinfo
+.cache/
+.npm/
+.pnpm-debug.log*
+*.log
+logs/
+
+# 打包产物（pnpm pack 生成）
+*.tgz
+
+# 环境变量文件（保留示例）
+.env
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+
+# 临时文件
+.tmp/
+tmp/
+*.swp
+*.swo
+*.bak

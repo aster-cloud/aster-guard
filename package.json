@@ -10,8 +10,8 @@
   },
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     }
   },
   "bin": {
@@ -31,7 +31,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "vitest run",
+    "test": "pnpm run build && vitest run",
     "lint": "eslint src test",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
