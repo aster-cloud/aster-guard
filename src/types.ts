@@ -34,6 +34,17 @@ export interface GuardDecisionApproval {
   id: string;
   requiredRole?: string;
   status: GuardApprovalStatus;
+  /** 以下决策字段由 aster-api 按需返回（null 时省略），见 ADR 0042 §4.3。 */
+  policyModule?: string;
+  policyFunction?: string;
+  actionName?: string;
+  resourceType?: string;
+  resourceId?: string;
+  ruleId?: string;
+  /** 命中规则关联的合规控制项，如 `GDPR:ART17`。 */
+  controls?: string[];
+  reason?: string;
+  evidenceCorrelationId?: string;
 }
 
 /** 被评估的活跃策略版本。 */
@@ -139,7 +150,8 @@ export interface GuardWaitOptions {
 export interface GuardApproveOptions {
   comment?: string;
   /**
-   * 审批人的业务角色，作为 `X-User-Business-Role` 头发送，与规则的 required role 精确比对。
+   * 仅作提示：仍作为 `X-User-Business-Role` 头发送，但 aster-api 以 API key 所属成员的已验证业务角色集合判定
+   * （aster-cloud 团队成员页授予，ADR 0042 §2.3），自报值不再放行。
    * HTTP 头只能携带 Latin-1 字符：非 Latin-1 的角色名（如中文）会被 fetch 在发出前拒绝，
    * 结果为 `{ ok: false, status: 0, error: 'client_error' }`。
    */

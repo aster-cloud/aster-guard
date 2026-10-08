@@ -5,12 +5,15 @@
 // aster-api 没有公开的 API key 创建与策略部署端点，二者都经 aster-cloud 或直写数据库完成，脚本只负责流程。
 // 通过 dist/ 里的公开 SDK 调用，运行前需先 `pnpm build`。
 //
+// 审批方用户须在 aster-cloud 团队成员页被授予 Data Protection Officer；服务端以 API key 所属成员的已验证业务角色集合判定（ADR 0042 §2.3），
+// ASTER_GUARD_APPROVER_ROLE 仅作提示。
+//
 // 环境变量：
 //   ASTER_GUARD_BASE_URL          aster-api 根地址，默认 http://localhost:8080
 //   ASTER_GUARD_API_KEY           请求方 API key，必填
 //   ASTER_GUARD_POLICY            <module>/<function>，默认 guard.customer/decide
 //   ASTER_GUARD_APPROVER_API_KEY  审批方 API key，可选；四眼规则要求审批方与请求方是不同的 key 与用户
-//   ASTER_GUARD_APPROVER_ROLE     审批方业务角色，默认 Data Protection Officer（作为 businessRole 发送）
+//   ASTER_GUARD_APPROVER_ROLE     审批方业务角色提示，默认 Data Protection Officer（作为 businessRole 发送，不决定放行）
 //
 // 退出码：0 全部通过（审批步骤因缺第二把 key 被 SKIP 也算通过）；1 断言失败；2 参数错误。
 import { GuardClient } from '../dist/index.js';

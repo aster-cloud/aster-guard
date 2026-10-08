@@ -257,6 +257,7 @@ Blocked by Aster Guard: <服务端 message> (decision n/a)
 
    `delete_customer_record` 需要「Data Protection Officer」审批，其余动作放行。
 3. **两把 API key**：请求方一把；审批方一把。「四眼」规则要求审批人与提交人是不同的已验证身份（用户与 API key 都不同），所以审批步骤必须用第二把 key。
+4. **审批方具备已验证的业务角色**：审批方用户须在 aster-cloud 团队成员页被授予 `Data Protection Officer`；`ASTER_GUARD_APPROVER_ROLE` 仅为提示，服务端以 API key 所属成员的已验证角色集合判定（ADR 0042 §2.3）。
 
 aster-api 没有公开的端点用来创建 API key 或部署策略，二者经 aster-cloud（或直接写库）完成。脚本假定它们已经就绪，所有参数都从环境变量读取。
 
@@ -277,7 +278,7 @@ node scripts/e2e-local.mjs
 | `ASTER_GUARD_BASE_URL` | aster-api 根地址，默认 `http://localhost:8080` |
 | `ASTER_GUARD_POLICY` | `<module>/<function>`，默认 `guard.customer/decide` |
 | `ASTER_GUARD_APPROVER_API_KEY` | 审批方 API key，可选；缺省时跳过审批步骤 |
-| `ASTER_GUARD_APPROVER_ROLE` | 审批方业务角色，默认 `Data Protection Officer`，作为 `businessRole`（`X-User-Business-Role` 头）发送 |
+| `ASTER_GUARD_APPROVER_ROLE` | 审批方业务角色，默认 `Data Protection Officer`，作为 `businessRole`（`X-User-Business-Role` 头）发送，仅作提示，不决定是否放行 |
 
 每次运行使用全新的 `principal.id`（`e2e-<时间戳>`）和新的幂等键，不会重放旧决策。
 
