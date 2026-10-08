@@ -34,17 +34,6 @@ export interface GuardDecisionApproval {
   id: string;
   requiredRole?: string;
   status: GuardApprovalStatus;
-  /** 以下决策字段由 aster-api 按需返回（null 时省略），见 ADR 0042 §4.3。 */
-  policyModule?: string;
-  policyFunction?: string;
-  actionName?: string;
-  resourceType?: string;
-  resourceId?: string;
-  ruleId?: string;
-  /** 命中规则关联的合规控制项，如 `GDPR:ART17`。 */
-  controls?: string[];
-  reason?: string;
-  evidenceCorrelationId?: string;
 }
 
 /** 被评估的活跃策略版本。 */
@@ -96,6 +85,17 @@ export interface GuardApproval {
   principalId: string;
   requiredRole?: string;
   status: GuardApprovalStatus;
+  /** 以下决策字段由 aster-api 按需返回（null 时省略），见 ADR 0042 §4.3。 */
+  policyModule?: string;
+  policyFunction?: string;
+  actionName?: string;
+  resourceType?: string;
+  resourceId?: string;
+  ruleId?: string;
+  /** 命中规则关联的合规控制项，如 `GDPR:ART17`。 */
+  controls?: string[];
+  reason?: string;
+  evidenceCorrelationId?: string;
 }
 
 /** 审批列表的一页；page 从 0 起，size 为服务端夹取后的实际值（1–200）。 */
