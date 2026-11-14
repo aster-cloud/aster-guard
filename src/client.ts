@@ -176,7 +176,14 @@ export class GuardClient {
       await report('failed', { errorCode: errorCodeOf(error) });
       return { kind: 'failed', decisionId: decision.decisionId, attemptId, error };
     }
-    const verdict = opts.classify?.(result) ?? { status: 'executed' as const };
+    let verdict: { status: 'executed' | 'failed'; errorCode?: string; resultHash?: string };
+    try {
+      verdict = opts.classify?.(result) ?? { status: 'executed' };
+    } catch (error) {
+      // 副作用已落地而归类失败：照样回写（failed / classify_error），不让已消耗的尝试没有结果记录。
+      await report('failed', { errorCode: 'classify_error' });
+      return { kind: 'failed', decisionId: decision.decisionId, attemptId, error };
+    }
     await report(verdict.status, { errorCode: verdict.errorCode, resultHash: verdict.resultHash });
     return { kind: 'executed', decisionId: decision.decisionId, attemptId, result };
   }

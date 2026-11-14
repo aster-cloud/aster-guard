@@ -160,6 +160,19 @@ describe('GuardClient.run', () => {
     expect(bodyOf(api, '/result')).toMatchObject({ status: 'failed', errorCode: 'tool_error', resultHash: 'a'.repeat(64) });
   });
 
+  it('classify 抛错：仍回写 failed / classify_error，以 failed 返回', async () => {
+    const { api, client } = setup();
+    const oops = new Error('classify oops');
+    const outcome = await client.run(INPUT, async () => 'x', {
+      ...EXEC,
+      classify: () => {
+        throw oops;
+      },
+    });
+    expect(outcome).toMatchObject({ kind: 'failed', error: oops });
+    expect(bodyOf(api, '/result')).toMatchObject({ status: 'failed', errorCode: 'classify_error' });
+  });
+
   it('resultWriteFailureDoesNotChangeOutcome', async () => {
     const { api, client } = setup();
     api.override((req) => (req.path.endsWith('/result') ? new Response('', { status: 503 }) : undefined));
