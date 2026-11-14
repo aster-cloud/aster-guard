@@ -1,4 +1,16 @@
+import { hostname } from 'node:os';
+import { hashAction, JcsError } from './hash/jcs.js';
+import { BEFORE_CONSUME, type InternalRunHooks } from './internal/hooks.js';
+import { JwksCache, verifyExecutionReceipt } from './receipt.js';
 import type {
+  GuardAction,
+  GuardGrant,
+  GuardJwk,
+  GuardResultStatus,
+  GuardRunOptions,
+  GuardRunOutcome,
+  GuardSideEffect,
+  ReceiptCheck,
   GuardActionInput,
   GuardApiError,
   GuardApprovalInput,
@@ -24,6 +36,13 @@ const DEFAULT_WAIT_INTERVAL_MS = 2_000;
 const MAX_WAIT_SECONDS = 30;
 
 const DECISIONS_PATH = '/api/v1/guard/decisions';
+const RECEIPTS_PATH = '/api/v1/guard/receipts';
+const KEYS_PATH = '/api/v1/guard/keys';
+const SIDE_EFFECTS_PATH = '/api/v1/guard/side-effects';
+/** executorId 的上限（ADR 0054 §5）。 */
+const MAX_EXECUTOR_ID = 255;
+/** consume 的 409 码（ADR 0040 §12 D5）；kid_revoked 归为 receipt_invalid 并强制刷新 JWKS。 */
+const CONSUME_CONFLICTS = new Set(['not_allowed', 'receipt_consumed', 'receipt_expired', 'action_mismatch']);
 const APPROVALS_PATH = '/api/v1/guard/approvals';
 
 const OUTCOMES = new Set<unknown>(['ALLOW', 'DENY', 'REQUIRE_APPROVAL', 'ESCALATE']);
@@ -61,6 +80,8 @@ export class GuardClient {
   private readonly timeoutMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+  private readonly tenantId: string | undefined;
+  private jwks: JwksCache | undefined;
 
   constructor(options: GuardClientOptions) {
     this.baseUrl = requireText(options.baseUrl, 'baseUrl').replace(/\/+$/, '');
@@ -76,6 +97,195 @@ export class GuardClient {
     this.fetchImpl = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.sleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.now = options.now ?? Date.now;
+    this.tenantId = options.tenantId;
+  }
+
+  /**
+   * 推荐入口（ADR 0054 §2.1）：按固定顺序「哈希 → 决策（PENDING 则等待）→ 验签 → consume → 执行 → 回写」运行一次受守卫动作。
+   * 任一步失败即返回，回调不被调用；没有跳过验签或 consume 的选项。只有本次请求的决策验签通过且 consume 200 才算授权
+   * （ADR 0054 §11.4）——别处读到的 ALLOW 或收据都不是。回调抛错 → 回写 failed 并以 `failed` 返回原错误（不吞）；
+   * 回写失败不影响结局（副作用已落地，回写是对账证据）。缺 tenantId 或 executorId 非法属于编程错误，抛 TypeError。
+   */
+  async run<T>(
+    input: GuardActionInput,
+    execute: (grant: GuardGrant) => Promise<T>,
+    opts: GuardRunOptions<T> = {},
+  ): Promise<GuardRunOutcome<T>> {
+    const tenantId = this.requireTenant('run');
+    const executorId = requireExecutorId(opts.executorId ?? `aster-guard-sdk@${hostname()}`);
+    const principal = input.principal ?? this.principal;
+    if (!principal) {
+      return blockedOutcome(undefined, 'client_error', 'principal 缺失：action.principal 与配置 principal 均未提供');
+    }
+    // 顶层可选键为 undefined 等同缺省（不进请求体，也不进哈希）；更深层的 undefined 由 hashAction 拒绝。
+    const action = Object.fromEntries(
+      Object.entries({ ...input, principal }).filter(([, value]) => value !== undefined),
+    ) as unknown as GuardAction;
+    let actionHash: string;
+    try {
+      actionHash = hashAction(action);
+    } catch (e) {
+      if (!(e instanceof JcsError)) throw e;
+      return blockedOutcome(undefined, 'client_error', `action 无法按 jcs-sha256/v1 规范化（${e.code}）：${e.message}`);
+    }
+    const first = await this.check(action, { idempotencyKey: crypto.randomUUID() });
+    let decision = first;
+    if (first.effectiveOutcome === 'PENDING') {
+      decision = await this.waitFor(first.decisionId, { timeoutMs: opts.approvalTimeoutMs, signal: opts.signal });
+      if (decision.reasonCode === 'wait_timeout') return { kind: 'pending', decision: first };
+      if (decision.reasonCode === 'wait_aborted') return blockedOutcome(first, 'cancelled', '调用方在审批结论前取消');
+    }
+    if (decision.effectiveOutcome !== 'ALLOW' || decision.decisionId === '') {
+      return { kind: 'blocked', decision };
+    }
+    const check = await this.verifyReceiptAgainst(decision.executionReceipt, {
+      tenantId,
+      decisionId: decision.decisionId,
+      actionHash,
+      policyVersionId: decision.policyVersion?.id,
+    });
+    if (!check.ok) {
+      return blockedOutcome(decision, 'receipt_invalid', `执行收据核对失败：${check.detail}`);
+    }
+    if (opts.signal?.aborted) return blockedOutcome(decision, 'cancelled', '调用方在 consume 前取消');
+    const attemptId = crypto.randomUUID();
+    (opts as InternalRunHooks)[BEFORE_CONSUME]?.();
+    // consume 时按当前对象重算哈希：决策之后若有人改了将被执行的对象，服务端以 409 action_mismatch 拒绝，而不是放行改过的动作。
+    let consumeHash: string;
+    try {
+      consumeHash = hashAction(action);
+    } catch (e) {
+      if (!(e instanceof JcsError)) throw e;
+      return blockedOutcome(decision, 'client_error', `action 在决策后变得无法规范化（${e.code}）`);
+    }
+    const consumed = await this.consume(decision.decisionId, { actionHash: consumeHash, attemptId, executorId });
+    if (!consumed.ok) {
+      return this.consumeRejected(decision, consumed, { attemptId, executorId });
+    }
+    const grant: GuardGrant = { decisionId: decision.decisionId, attemptId, actionHash: consumeHash };
+    const report = (status: GuardResultStatus, extra: { errorCode?: string; resultHash?: string } = {}) =>
+      this.reportResult(decision.decisionId, { attemptId, executorId, status, ...extra }).catch(() => undefined);
+    if (opts.signal?.aborted) {
+      await report('aborted', { errorCode: 'cancelled' });
+      return blockedOutcome(decision, 'cancelled', '调用方在执行前取消（已 consume，未执行）');
+    }
+    let result: T;
+    try {
+      result = await execute(grant);
+    } catch (error) {
+      await report('failed', { errorCode: errorCodeOf(error) });
+      return { kind: 'failed', decisionId: decision.decisionId, attemptId, error };
+    }
+    const verdict = opts.classify?.(result) ?? { status: 'executed' as const };
+    await report(verdict.status, { errorCode: verdict.errorCode, resultHash: verdict.resultHash });
+    return { kind: 'executed', decisionId: decision.decisionId, attemptId, result };
+  }
+
+  /** 验签公钥（`GET /api/v1/guard/keys`）。 */
+  async keys(): Promise<({ ok: true; revision: number; keys: GuardJwk[] }) | GuardApiError> {
+    const result = interpret(await this.exchange('GET', KEYS_PATH), isKeySet);
+    return result.ok ? { ok: true, revision: result.body.revision, keys: result.body.keys } : result;
+  }
+
+  /**
+   * 核对收据（ADR 0040 §12 D6 + ADR 0054 §11 D12）：expect 给出本次决策 id、本地 actionHash 与同一响应的策略版本 id。
+   * 低层方法，供代理与测试使用；业务代码用 {@link run}。
+   */
+  verifyReceipt(
+    receipt: unknown,
+    expect: { decisionId: string; actionHash: string; policyVersionId: number | undefined },
+  ): Promise<ReceiptCheck> {
+    return this.verifyReceiptAgainst(receipt, { tenantId: this.requireTenant('verifyReceipt'), ...expect });
+  }
+
+  /** 消耗收据（低层；先验签再调用）。409 时 `error` 为服务端码，`body` 为原始错误体。 */
+  async consume(
+    decisionId: string,
+    body: { actionHash: string; attemptId: string; executorId: string },
+  ): Promise<{ ok: true; consumedAt: string } | (GuardApiError & { body?: Record<string, unknown> })> {
+    const exchange = await this.exchange('POST', `${RECEIPTS_PATH}/${encodeURIComponent(decisionId)}/consume`, { body });
+    const result = interpret(exchange, isConsumed);
+    if (result.ok) return { ok: true, consumedAt: result.body.consumedAt };
+    return exchange.kind === 'response' && isRecord(exchange.body) ? { ...result, body: exchange.body } : result;
+  }
+
+  /** 结果回写（低层）。 */
+  async reportResult(
+    decisionId: string,
+    body: {
+      attemptId: string;
+      executorId: string;
+      status: GuardResultStatus;
+      finishedAt?: string;
+      resultHash?: string;
+      errorCode?: string;
+    },
+  ): Promise<{ ok: true } | GuardApiError> {
+    const payload = { ...body, finishedAt: body.finishedAt ?? new Date(this.now()).toISOString() };
+    const result = interpret(
+      await this.exchange('POST', `${RECEIPTS_PATH}/${encodeURIComponent(decisionId)}/result`, { body: payload }),
+      isRecord,
+    );
+    return result.ok ? { ok: true } : result;
+  }
+
+  /**
+   * 副作用上报（#465，ADR 0054 §10.2 / §10.5 I2）：给**工具侧 / 业务系统**用——每次实际执行后上报一条，有 consume 票据
+   * 带票据里的 decisionId / attemptId，没有也照报；网络重试沿用同一 effectId。代理与 SDK 执行方不上报（§11.5）。
+   */
+  async reportSideEffects(
+    effects: GuardSideEffect[],
+  ): Promise<{ ok: true; accepted: number; duplicates: number } | GuardApiError> {
+    const result = interpret(await this.exchange('POST', SIDE_EFFECTS_PATH, { body: { effects } }), isSideEffectAck);
+    return result.ok ? { ok: true, ...result.body } : result;
+  }
+
+  private async verifyReceiptAgainst(
+    receipt: unknown,
+    expect: { tenantId: string; decisionId: string; actionHash: string; policyVersionId: number | undefined },
+  ): Promise<ReceiptCheck> {
+    return verifyExecutionReceipt(receipt, expect, this.jwksCache(), this.now);
+  }
+
+  private jwksCache(): JwksCache {
+    this.jwks ??= new JwksCache(async () => {
+      const keys = await this.keys();
+      return keys.ok ? { revision: keys.revision, keys: keys.keys } : undefined;
+    }, this.now);
+    return this.jwks;
+  }
+
+  /** consume 未成功：响应丢失 → 尽力回写 aborted；kid_revoked → 强制刷新 JWKS 并按 receipt_invalid 拒绝。 */
+  private async consumeRejected<T>(
+    decision: GuardDecision,
+    rejected: GuardApiError & { body?: Record<string, unknown> },
+    attempt: { attemptId: string; executorId: string },
+  ): Promise<GuardRunOutcome<T>> {
+    if (rejected.status === 0 || rejected.status >= 500) {
+      // consume 可能已在服务端生效：不执行，回写 aborted 让对账知道这次尝试放弃了（ADR 0040 §12 D5）。
+      await this.reportResult(decision.decisionId, {
+        ...attempt,
+        status: 'aborted',
+        errorCode: 'consume_response_lost',
+      }).catch(() => undefined);
+      const code = rejected.error === 'client_timeout' ? 'client_timeout' : 'client_error';
+      return blockedOutcome(decision, code, `consume 未得到确认：${rejected.message}`);
+    }
+    if (rejected.status === 409 && rejected.error === 'kid_revoked') {
+      const revision = rejected.body?.revision;
+      if (typeof revision === 'number') await this.jwksCache().noteRevision(revision);
+      else await this.jwksCache().forceRefresh();
+      return blockedOutcome(decision, 'receipt_invalid', '签名密钥已吊销');
+    }
+    const code = rejected.status === 409 && CONSUME_CONFLICTS.has(rejected.error) ? rejected.error : 'client_error';
+    return blockedOutcome(decision, code, `consume 被拒绝（HTTP ${rejected.status} ${rejected.error}）`);
+  }
+
+  private requireTenant(method: string): string {
+    if (typeof this.tenantId !== 'string' || this.tenantId.trim() === '') {
+      throw new TypeError(`GuardClient.${method}: 需要配置 tenantId（核对收据租户）`);
+    }
+    return this.tenantId;
   }
 
   /**
@@ -328,6 +538,46 @@ function isSuccess(status: number): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** run 的阻断结局：effectiveOutcome 一律 DENY，保留已知的 decisionId / outcome，便于追查。 */
+function blockedOutcome<T>(base: GuardDecision | undefined, reasonCode: string, reason: string): GuardRunOutcome<T> {
+  return {
+    kind: 'blocked',
+    decision: {
+      ...(base ?? {}),
+      decisionId: base?.decisionId ?? '',
+      outcome: base?.outcome ?? 'DENY',
+      effectiveOutcome: 'DENY',
+      reasonCode,
+      reason,
+    },
+  };
+}
+
+function errorCodeOf(error: unknown): string {
+  const name = error instanceof Error ? error.name : typeof error;
+  return /^[A-Za-z0-9_.-]{1,64}$/.test(name) ? name : 'error';
+}
+
+/** executorId：1–255 字符、无控制字符（ADR 0054 §5）。 */
+export function requireExecutorId(value: string): string {
+  if (typeof value !== 'string' || value.trim() === '' || value.length > MAX_EXECUTOR_ID || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new TypeError(`executorId 须为 1–${MAX_EXECUTOR_ID} 个字符且不含控制字符`);
+  }
+  return value;
+}
+
+function isKeySet(body: unknown): body is { revision: number; keys: GuardJwk[] } {
+  return isRecord(body) && typeof body.revision === 'number' && Array.isArray(body.keys);
+}
+
+function isConsumed(body: unknown): body is { consumedAt: string } {
+  return isRecord(body) && typeof body.consumedAt === 'string';
+}
+
+function isSideEffectAck(body: unknown): body is { accepted: number; duplicates: number } {
+  return isRecord(body) && typeof body.accepted === 'number' && typeof body.duplicates === 'number';
 }
 
 /** 只认三值内的 effectiveOutcome：未知结论绝不能被调用方误当成放行。 */
