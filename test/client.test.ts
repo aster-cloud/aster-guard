@@ -594,7 +594,8 @@ describe('GuardClient 审批输入（aster-api#460，ADR 0042 §12 D8）', () =>
     delete withoutHash.inputSnapshotHash;
     const withoutRules: Record<string, unknown> = { ...VIEW };
     delete withoutRules.maskRules;
-    for (const body of [{ approvalId: 'a-1' }, { ...VIEW, status: 'mystery' }, [VIEW], withoutHash, withoutRules]) {
+    for (const body of [{ approvalId: 'a-1' }, { ...VIEW, status: 'mystery' }, [VIEW], withoutHash, withoutRules,
+      { ...VIEW, marksSource: 'catalog' }, { ...VIEW, inputBinding: 'maybe' }]) {
       const fetchMock = vi.fn(async () => json(200, body));
       await expect(client(fetchMock).getApprovalInput('a-1')).resolves.toMatchObject({
         ok: false,

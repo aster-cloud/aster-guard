@@ -352,6 +352,9 @@ const INPUT_STATUSES: ReadonlySet<unknown> = new Set([
   'too_large',
 ]);
 
+const MARKS_SOURCES: ReadonlySet<unknown> = new Set(['version', 'evaluation', 'none']);
+const INPUT_BINDINGS: ReadonlySet<unknown> = new Set(['direct', 'evaluated', 'unbound']);
+
 /**
  * 只认已知状态：未知状态的视图不能被当成可审阅的输入。`available` 时视图字段与快照哈希必须齐全，
  * 否则调用方会拿着不完整的视图去审批；其余状态没有输入快照，只要求公共字段。
@@ -372,8 +375,8 @@ function isApprovalInput(body: unknown): body is GuardApprovalInput {
     body.status !== 'available' ||
     (typeof body.contextHash === 'string' &&
       typeof body.inputSnapshotHash === 'string' &&
-      typeof body.marksSource === 'string' &&
-      typeof body.inputBinding === 'string' &&
+      MARKS_SOURCES.has(body.marksSource) &&
+      INPUT_BINDINGS.has(body.inputBinding) &&
       isRecord(body.input))
   );
 }
