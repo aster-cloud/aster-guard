@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ConfigError, parseCliArgs, upstreamEnv, USAGE, wantsHelp } from '../src/mcp/config.js';
 
@@ -12,6 +15,8 @@ const REQUIRED = [
   'agent-42',
 ];
 const ENV = { ASTER_GUARD_API_KEY: 'ak_test' };
+/** 代理模式的必填执行点参数（ADR 0054 R66 D8）。 */
+const EXEC = ['--tenant-id', 'team-1', '--isolation', 'network'];
 
 describe('parseCliArgs', () => {
   it('完整参数解析为 ProxyConfig', () => {
@@ -39,6 +44,11 @@ describe('parseCliArgs', () => {
         'customerId',
         '--agent-model',
         'claude-x',
+        ...EXEC,
+        '--tools',
+        'echo, delete_customer',
+        '--executor-id',
+        'aster-guard-mcp@host-1',
       ],
       { MY_GUARD_KEY: 'ak_custom' },
     );
@@ -55,6 +65,11 @@ describe('parseCliArgs', () => {
       upstreamTimeoutMs: 120_000,
       resourceFromArg: 'customerId',
       agentModel: 'claude-x',
+      tenantId: 'team-1',
+      isolation: 'network',
+      executorId: 'aster-guard-mcp@host-1',
+      tools: ['echo', 'delete_customer'],
+      actions: {},
     });
   });
 
@@ -70,6 +85,8 @@ describe('parseCliArgs', () => {
       principal: { id: 'agent-42', type: 'agent' },
       approvalTimeoutMs: 300_000,
       upstreamTimeoutMs: 600_000,
+      executorId: `aster-guard-mcp@${hostname()}`,
+      actions: {},
     });
   });
 
@@ -191,7 +208,7 @@ describe('--upstream 按 shell 规则切分', () => {
     ["cmd '' \"\"", ['cmd', '', '']],
     ["cmd '\\n'", ['cmd', '\\n']],
   ])('%j', (input, [command, ...args]) => {
-    expect(parseCliArgs([...REQUIRED, '--upstream', input], ENV).upstream).toEqual({ command, args });
+    expect(parseCliArgs([...REQUIRED, ...EXEC, '--upstream', input], ENV).upstream).toEqual({ command, args });
   });
 
   it.each([
@@ -199,7 +216,7 @@ describe('--upstream 按 shell 规则切分', () => {
     ['单引号未闭合', "cmd 'abc"],
     ['空命令', ''],
   ])('%s → ConfigError', (_label, input) => {
-    expect(() => parseCliArgs([...REQUIRED, '--upstream', input], ENV)).toThrow(ConfigError);
+    expect(() => parseCliArgs([...REQUIRED, ...EXEC, '--upstream', input], ENV)).toThrow(ConfigError);
   });
 });
 
@@ -208,5 +225,53 @@ describe('upstreamEnv', () => {
     expect(
       upstreamEnv({ PATH: '/bin', GITHUB_TOKEN: 'gh', ASTER_GUARD_API_KEY: 'ak', EMPTY: undefined }, 'ASTER_GUARD_API_KEY'),
     ).toEqual({ PATH: '/bin', GITHUB_TOKEN: 'gh' });
+  });
+});
+
+describe('执行点配置（ADR 0054 §3.1–3.3）', () => {
+  const PROXY = [...REQUIRED, '--upstream', 'node server.js'];
+
+  it('configRequiresTenantAndIsolationWithUpstream', () => {
+    expect(() => parseCliArgs(PROXY, ENV)).toThrow(/--tenant-id/);
+    expect(() => parseCliArgs([...PROXY, '--tenant-id', 't'], ENV)).toThrow(/--isolation/);
+    expect(() => parseCliArgs([...PROXY, '--tenant-id', 't', '--isolation', 'vpn'], ENV)).toThrow(/network 或 auth/);
+    expect(parseCliArgs([...PROXY, ...EXEC], ENV)).toMatchObject({ tenantId: 'team-1', isolation: 'network' });
+  });
+
+  it('执行点参数只用于代理模式', () => {
+    expect(() => parseCliArgs([...REQUIRED, '--tenant-id', 't'], ENV)).toThrow(/只用于代理模式/);
+    expect(() => parseCliArgs([...REQUIRED, '--tools', 'a'], ENV)).toThrow(/只用于代理模式/);
+  });
+
+  it('executorIdDefaultsToHostname 与校验', () => {
+    expect(parseCliArgs([...PROXY, ...EXEC], ENV).executorId).toBe(`aster-guard-mcp@${hostname()}`);
+    expect(() => parseCliArgs([...PROXY, ...EXEC, '--executor-id', 'x'.repeat(256)], ENV)).toThrow(ConfigError);
+  });
+
+  function configFile(content: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'aster-guard-config-'));
+    const path = join(dir, 'guard.json');
+    writeFileSync(path, JSON.stringify(content));
+    return path;
+  }
+
+  it('配置文件：tools 与 actions；--tools 覆盖文件 tools', () => {
+    const path = configFile({ tools: ['send_email'], actions: { send_email: { resourceFrom: 'to', digestArgs: ['body', 'body'] } } });
+    const config = parseCliArgs([...PROXY, ...EXEC, '--config', path], ENV);
+    expect(config.tools).toEqual(['send_email']);
+    expect(config.actions).toEqual({ send_email: { resourceFrom: 'to', digestArgs: ['body'] } });
+    expect(() => parseCliArgs([...PROXY, ...EXEC, '--config', path, '--tools', 'other'], ENV)).toThrow(/不在白名单内/);
+  });
+
+  it('unknownConfigKeyRejected', () => {
+    expect(() => parseCliArgs([...PROXY, ...EXEC, '--config', configFile({ tools: ['a'], skipGuard: ['a'] })], ENV)).toThrow(ConfigError);
+    expect(() =>
+      parseCliArgs([...PROXY, ...EXEC, '--config', configFile({ actions: { a: { excludeArgs: ['x'] } } })], ENV),
+    ).toThrow(ConfigError);
+  });
+
+  it('mappingForToolOutsideAllowListRejected', () => {
+    const path = configFile({ tools: ['a'], actions: { b: { actionName: 'b' } } });
+    expect(() => parseCliArgs([...PROXY, ...EXEC, '--config', path], ENV)).toThrow(/不在白名单内/);
   });
 });

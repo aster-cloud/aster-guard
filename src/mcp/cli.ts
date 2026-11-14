@@ -70,8 +70,16 @@ async function connectUpstream(
 async function serve(config: ProxyConfig, upstream: Client | undefined): Promise<void> {
   const { baseUrl, apiKey, policyModule, policyFunction, principal } = config;
   const { approvalTimeoutMs, upstreamTimeoutMs, resourceFromArg, agentModel } = config;
+  const { tenantId, executorId, isolation, tools, actions } = config;
+  if (upstream && tools === undefined) {
+    log('警告：未配置工具白名单（--tools 或配置文件 tools），全部上游工具都会暴露给模型');
+  }
   const proxy = createGuardProxyServer({
-    client: new GuardClient({ baseUrl, apiKey, policyModule, policyFunction, principal }),
+    client: new GuardClient({ baseUrl, apiKey, policyModule, policyFunction, principal, tenantId }),
+    executorId,
+    isolation,
+    tools,
+    actions,
     upstream,
     principal,
     approvalTimeoutMs,
