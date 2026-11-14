@@ -109,13 +109,17 @@ export function guardMeta(result: unknown): Record<string, unknown> {
   return ((result as { _meta?: Record<string, unknown> })._meta?.asterGuard ?? {}) as Record<string, unknown>;
 }
 
-/** `GET /api/v1/audit/receipts?decisionIds=` 的 consumes / results 计数（端点不可用时为 undefined，用例改以决策回读为准）。 */
+/**
+ * `GET /api/v1/audit/receipts?decisionIds=` 中该决策的**权威** consume / result 事件数（ADR 0041 §12 D1：只认权威尝试，
+ * 被拒的重放尝试也会入链但不是权威）。端点不可用时为 undefined，用例改以决策回读为准。
+ */
 export async function receiptsOf(decisionId: string): Promise<{ consumes: number; results: number } | undefined> {
   const res = await fetchWith(env.extraHeaders)(`${env.baseUrl}/api/v1/audit/receipts?decisionIds=${decisionId}`, {
     headers: { Authorization: `Bearer ${env.apiKey}` },
   });
   if (res.status !== 200) return undefined;
-  const body = (await res.json()) as { receipts?: Array<{ consumes?: unknown[]; results?: unknown[] }> };
-  const row = body.receipts?.[0];
-  return row ? { consumes: row.consumes?.length ?? 0, results: row.results?.length ?? 0 } : { consumes: 0, results: 0 };
+  type Row = { decisionId?: string; authoritative?: boolean };
+  const body = (await res.json()) as { consumes?: Row[]; results?: Row[] };
+  const count = (rows: Row[] | undefined) => (rows ?? []).filter((r) => r.decisionId === decisionId && r.authoritative).length;
+  return { consumes: count(body.consumes), results: count(body.results) };
 }

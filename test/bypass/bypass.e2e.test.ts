@@ -26,7 +26,7 @@ e2e('绕过夹具套件（本地 aster-api）', { timeout: 30_000 }, () => {
       expect(rig.sideEffects).toEqual([]);
       expect(await consumedBy(String(meta.decisionId))).toBeUndefined();
       const receipts = await receiptsOf(String(meta.decisionId));
-      if (receipts) expect(receipts).toEqual({ consumes: 0, results: 0 });
+      expect(receipts).toEqual({ consumes: 0, results: 0 });
     } finally {
       await rig.close();
     }
@@ -101,7 +101,7 @@ e2e('绕过夹具套件（本地 aster-api）', { timeout: 30_000 }, () => {
     expect(replay).toMatchObject({ ok: false, status: 409, error: 'receipt_consumed' });
     expect(sideEffects).toHaveLength(1);
     const receipts = await receiptsOf(outcome.decisionId);
-    if (receipts) expect(receipts.results).toBe(1);
+    expect(receipts).toEqual({ consumes: 1, results: 1 });
   });
 
   describe('#1b authTicketChecks：工具侧票据核对（auth 隔离）', () => {
