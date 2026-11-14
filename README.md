@@ -11,7 +11,7 @@ AI Agent 在执行有副作用的动作之前（删除客户记录、转账、�
 
 设计依据见 aster-api 仓库 `docs/adr/0040-action-guard.md`（ADR 0040：Action Guard，本包对应 §6），随子项目 2 合并后可见。
 
-> **当前状态：0.1.0，尚未发布。** `GuardClient` 与 `aster-guard-mcp` 均已实现。
+> **当前状态：0.2.0（执行点，aster-api ADR 0054 / R66），尚未发布。** 0.1.0 从未发布。0.2.0 起 Guard 是**执行点**而不是建议：只有本次决策的执行收据验签通过且 consume 成功，动作才会执行。行为变化见文末「0.2.0 行为变化」。
 
 ## 安装
 
@@ -34,6 +34,31 @@ Authorization: Bearer ak_…
 API key 同时决定租户、计量与配额。审批的「四眼」规则也会比对提交决策所用的 API key：提交某个动作的 key 不能批准同一动作（见 ADR 0040 §4.2）。
 
 ## GuardClient
+
+### 推荐入口：`run`（ADR 0054 §2.1）
+
+```ts
+const guard = new GuardClient({ baseUrl, apiKey, policyModule: 'guard.customer', policyFunction: 'decide',
+  principal: { id: 'agent-42', type: 'agent' }, tenantId: 'team-1' /* API key 所属租户，核对收据用 */ });
+
+const outcome = await guard.run(
+  { action: { name: 'delete_customer_record' }, resource: { type: 'customer', id: 'C-1001' }, context: { amount: 250000 } },
+  async (grant) => deleteCustomerRecord('C-1001'), // 只有 consume 200 之后才会被调用
+  { executorId: 'billing-worker@pod-3', approvalTimeoutMs: 300_000 },
+);
+// outcome.kind: 'executed' | 'blocked' | 'pending' | 'failed'
+```
+
+`run` 的顺序固定，任一步失败即返回、回调不被调用：`hashAction(action)`（jcs-sha256/v1，与请求体是同一个对象）→ `POST /decisions`（PENDING 则等待审批）→ 执行收据验签（JWKS 缓存 300 s；`payload.tenantId / decisionId / outcome / 时间窗 / actionHash`，以及 `payload.policyVersionId` 必须等于同一响应的 `policyVersion.id`——收据的 `actionHash` 不含策略模块，见 ADR 0054 §11 D12）→ consume（consume 时按当前对象**重算**哈希，决策后被改动的动作得到 409 `action_mismatch`）→ 回调 → 结果回写。没有任何跳过验签或 consume 的选项；只有本次请求的决策 consume 成功才是授权，别处读到的 ALLOW 或收据都不是（§11.4）。
+
+- `executorId` 缺省 `aster-guard-sdk@<hostname>`（#465 对账的执行方标签）；须 ≤ 255 字符、无控制字符。
+- consume 响应丢失（超时 / 断网 / 5xx）：不执行，尽力回写 `aborted / consume_response_lost`，返回 `blocked client_timeout|client_error`。
+- 回调抛错：回写 `failed` 后以 `failed` 返回原错误；`classify` 可把返回值归为 `failed`（如工具业务错误）。回写失败不影响结局。
+- 值必须可按 jcs-sha256/v1 表示：`NaN`、`Infinity`、`undefined`（顶层可选键除外）、`bigint`、`Date` 等非纯对象、|x| > 2^53−1 的数在发送前即 `blocked client_error`（大数请用字符串）。
+- 低层方法 `check / verifyReceipt / consume / reportResult / keys / hashAction` 公开，供代理与测试使用。
+- `reportSideEffects(effects)`（#465）给**工具侧 / 业务系统**上报实际落地的副作用；代理与 `run` 是执行方，不上报。
+
+### 低层：`check`
 
 用法（ADR 0040 §6）：
 
@@ -105,9 +130,9 @@ const r = await guard.approve(approvalId, { comment: '已核对', inputSnapshotH
 
 stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 MCP 服务器：原样转发 `tools/list`，并拦截每一次 `tools/call`：
 
-1. 构造 Action：`action.name` 为工具名，`context` 为剔除 `null` 后的工具参数，`principal` 来自配置；指定 `--resource-from <argName>` 时，取该参数的值作为 `resource: { type: 'arg', id }`；`--agent-model` 写入 `agent.model`。规整规则见下文「服务端 Action 限制」。
-2. 以新的 UUID 作幂等键调用 `GuardClient.check`（每次调用一个新键，不从 JSON-RPC 请求 id 派生）。
-3. 只有服务端确认的 `ALLOW` 才转发给上游（原始参数），上游结果原样返回；`DENY` 返回工具错误 `Blocked by Aster Guard: <reason> (decision <id>)`，guard 不可达或请求被服务端拒绝时 decision 为 `n/a`；`PENDING` 则等待审批，最长 `--approval-timeout` 秒（默认 300），再按最终结论转发或拒绝。等待期间下游取消请求的，代理随即停止轮询，审批随后通过也不再转发。
+1. 工具须在白名单内（`--tools` / 配置文件 `tools`；未配置则全部暴露并在启动时告警）；参数先**规范化**：递归按键排序、`null` 原样保留、不删键不改类型。规范化后的对象既是 `action.context` 也是转发给上游的 `arguments`（同一对象）；按工具映射 `digestArgs` 列出的键在 `context` 中以 `{ "$sha256": … }` 代入（转发原值）。
+2. `GuardClient.run` 按固定顺序执行：决策（新 UUID 幂等键；PENDING 等到 `--approval-timeout`）→ 收据验签 → consume → 转发 → 回写（`executed` / `failed`，`resultHash` 为 `content` 的 jcs-sha256/v1）。
+3. 返回：ALLOW 时为上游原值并附 `_meta.asterGuard = { decisionId, attemptId }`；规则 DENY、等待超时仍 PENDING、验签 / consume / 网络失败分别返回 `isError: true` 与结构化载荷 `{ asterGuard: { status: 'denied' | 'pending' | 'blocked', … } }`——载荷**总在** `_meta`，上游工具未声明 `outputSchema` 时另放 `structuredContent`（MCP SDK 会按 `outputSchema` 校验错误结果）；`content[0].text` 保留 `Blocked by Aster Guard: <why> (decision <id>)`。这些字段是**非授权信息**：再次调用同名工具是新决策，旧审批随后通过也不会让任何调用转发。下游在 consume 之后、转发之前取消的，不转发并回写 `aborted`。
 4. 转发后最长等待上游 `--upstream-timeout` 秒（默认 600），上游每报告一次 progress 重新计时；超时则下游收到 MCP 协议错误（`RequestTimeout`），不是工具结果。上游此时可能仍在执行，重试前先确认副作用是否已发生。
 5. 上游没有的工具名返回 MCP 协议错误，不发起裁决。
 
@@ -150,6 +175,11 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 | `--upstream-timeout <seconds>` | 正整数，默认 600；放行后等待上游工具返回的最长秒数，上游报告 progress 时重新计时 |
 | `--resource-from <argName>` | 以该工具参数的值作为 `resource.id`；过长或含控制字符时改用 `sha256:<hex>` |
 | `--agent-model <model>` | 写入 `action.agent.model` |
+| `--tenant-id <id>` | 代理模式必填：API key 所属租户，收据 `payload.tenantId` 须与之相等 |
+| `--isolation network\|auth` | 代理模式必填（配置自述，由部署层绕过测试验证）：`network` = 上游只接受代理的连接（stdio 子进程天然满足）；`auth` = 转发时在 `params._meta["io.aster/guard-consume"]` 附 consume 票据，工具侧用 `@aster-cloud/aster-guard/tool` 核对 |
+| `--tools <a,b>` | 工具白名单（覆盖配置文件 `tools`） |
+| `--config <file.json>` | `{ "tools": [...], "actions": { "<tool>": { "resourceFrom", "digestArgs", "actionName" } } }`，未知键报错，`actions` 中的工具须在白名单内 |
+| `--executor-id <id>` | 对账用执行方标识，默认 `aster-guard-mcp@<hostname>` |
 
 `--principal-id`、`--principal-type`、`--agent-model` 与每个角色须为 1–255 字符且不含控制字符，否则以参数错误退出（见下文「服务端 Action 限制」）。
 
@@ -225,6 +255,43 @@ Cursor 配置示例（项目级 `.cursor/mcp.json`，或全局 `~/.cursor/mcp.js
 >
 > `npx -y -p @aster-cloud/aster-guard aster-guard-mcp` 用 `-p` 指明要安装的包，再写要运行的命令名 `aster-guard-mcp`。不要写成 `npx -y @aster-cloud/aster-guard aster-guard-mcp …`：命令名会被当作多余的位置参数而报错（退出码 2）。全局安装后也可直接把 `command` 写成 `aster-guard-mcp`，`args` 去掉前四项。`--base-url` 换成实际的 aster-api 地址；`ASTER_GUARD_API_KEY` 是请求方的 API key。
 
+### auth 隔离：工具侧核对 consume 票据
+
+上游工具可改时，用 `--isolation auth` 让工具自己拒绝不经代理的调用（ADR 0054 §3.3，R66 D2 / D11 / D12）：
+
+```ts
+import { GuardClient } from '@aster-cloud/aster-guard';
+import { MemoryAttemptLedger, verifyConsumeTicket } from '@aster-cloud/aster-guard/tool';
+
+const guard = new GuardClient({ baseUrl, apiKey: process.env.TOOL_API_KEY!, policyModule: '-', policyFunction: '-' }); // 工具自己的 key
+const ledger = new MemoryAttemptLedger(); // 单副本；多副本必须用共享持久存储实现 AttemptLedger（如数据库唯一键）
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const verdict = await verifyConsumeTicket({
+    meta: req.params._meta, args: req.params.arguments, toolName: req.params.name,
+    mapping: actions[req.params.name], policy: { module: 'guard.customer', function: 'decide' }, client: guard, ledger,
+  });
+  if (!verdict.ok) return { isError: true, content: [{ type: 'text', text: `401 ${verdict.reason}` }] }; // 不执行
+  // …执行副作用；建议把 verdict.attemptId 与副作用同事务落库，或作业务幂等键
+});
+```
+
+核对顺序：票据形状 → 用工具自己的 key 回读决策（不可达 / 非 200 → `guard_unavailable`）→ `ALLOW` → 回读的 `policyModule / policyFunction` 等于期望策略（`policy_mismatch`）→ 票据 `envelope` 的动作名与资源等于工具自己的映射、按工具自己的映射对**实际收到的参数**重算哈希（`action_mismatch`）→ `consumedBy.attemptId`（`attempt_mismatch`）→ 时间窗（`ticket_expired`）→ 未写结果（`result_recorded`）→ 原子认领 attemptId（`ticket_replayed`）。这是 **at-most-once 放行**：认领后工具崩溃则动作不执行，须重新申请决策。`MemoryAttemptLedger` 重启后 ttl 窗口内同一票据可再被放行一次——多副本或会重启的工具必须提供共享持久存储实现。
+
+> stdio 模式下宿主若同时配置了原始上游，模型可以绕过代理——这是部署配置问题（ADR 0054 §2），由 `auth` 模式兜底、由 #466 部署层测试证明。
+
+## 绕过套件
+
+`test/bypass/` 是 ADR 0054 §7 的夹具层：`static-no-branch-on-reason`（代码不据 `reason / reasonCode / approvalId / poll / requiredRole` 分支）与 #5（伪造 / 篡改 / 过期收据不 consume）始终启用；#2 / #2b / #3 / #4 / #1b 需要本地 aster-api：
+
+```bash
+ASTER_GUARD_E2E=1 ASTER_GUARD_BASE_URL=http://localhost:8080 ASTER_GUARD_API_KEY=… ASTER_GUARD_TENANT_ID=… \
+ASTER_GUARD_POLICY=guard.bypass/decide [ASTER_GUARD_LENIENT_POLICY=guard.lenient/decide] \
+[ASTER_GUARD_EXTRA_HEADERS='{"X-Tenant-Id":"…"}'] pnpm exec vitest run test/bypass
+```
+
+`ASTER_GUARD_POLICY` 须对 `refund_payment` 给 DENY、其余 ALLOW；`ASTER_GUARD_LENIENT_POLICY`（可选）对一切 ALLOW，用于 #517 换模块用例。夹具层只证明代理逻辑，原始工具端点不可达由部署层证明。
+
 ## 服务端 Action 限制
 
 aster-api 在裁决前校验 Action（`GuardActionMapper`），不合规的请求整体返回 400 `invalid_action`，不产生决策：
@@ -239,15 +306,11 @@ aster-api 在裁决前校验 Action（`GuardActionMapper`），不合规的请�
 
 ```text
 Blocked by Aster Guard: <服务端 message> (decision n/a)
-例：Blocked by Aster Guard: context 不允许 null 值 (decision n/a)
 ```
 
-为免常见输入被整体拒绝，代理在 `check` 前做两处规整（只作用于提交给 guard 的 Action，转发给上游的仍是原始参数）：
+0.2.0 起代理不再改写参数：`null` 原样进入 `context`（aster-api R63 起接受），与转发给上游的参数是同一个规范化对象（见上文）。唯一的派生值是 **资源 id**：`resource.id` 取 `resourceFrom` 参数的值（字符串，或对象 / 数组的 JSON），超过 255 字符或含控制字符时改为 `sha256:<64 位十六进制>`，同一个值总得到同一个 id。
 
-- **剔除 `null`**：宿主与模型常用 `null` 表示「未提供的可选参数」。代理递归剔除 `context` 中值为 `null` 的键与数组里的 `null` 元素；对规则而言 `null` 与缺省等价。
-- **哈希资源 id**：`--resource-from` 取到的值（字符串，或对象 / 数组的 JSON）超过 255 字符或含控制字符时，`resource.id` 改为 `sha256:<64 位十六进制>`，同一个值总得到同一个 id。
-
-`--principal-id`、`--principal-type`、`--agent-model` 与 `--principal-roles` 各项在启动时按上表校验，违反即以退出码 2 结束，而不是让每一次调用都被拒绝。`context` 的深度与大小代理不做改写：超出时（例如给文件写入工具传入超过 64 KB 的内容）调用会以上述文本被拒绝。
+`--principal-id`、`--principal-type`、`--agent-model` 与 `--principal-roles` 各项在启动时按上表校验，违反即以退出码 2 结束，而不是让每一次调用都被拒绝。`context` 的深度与大小代理不做改写：超出时（例如给文件写入工具传入超过 64 KB 的内容）调用会以 `blocked http_400` 被拒绝；大字段请用 `digestArgs`。
 
 ## 本地端到端
 
@@ -347,6 +410,15 @@ pnpm run build       # tsc → dist/
 ```
 
 提交流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题见 [SECURITY.md](SECURITY.md)。
+
+## 0.2.0 行为变化
+
+- 工具参数里的 `null` 不再剔除：`null`、缺失与 `""` 是三个不同的动作（aster-api R63 起接受 `context` 中的 null）。
+- ALLOW 不再直接转发：须执行收据验签通过且 consume 成功；旧 aster-api（无收据）上一律 `blocked receipt_invalid`。
+- 代理模式必填 `--tenant-id` 与 `--isolation`；新增 `--tools`、`--config`、`--executor-id`。
+- DENY / PENDING / 阻断返回结构化载荷（`_meta.asterGuard`）；PENDING 与 DENY 不再同形。
+- 新子路径 `@aster-cloud/aster-guard/tool`（`auth` 隔离的工具侧核对）。
+- 未被 consume 的 ALLOW 是治理缺口（ADR 0040 §12 D10）：#465 对账记为 `allow_unconsumed`。
 
 ## 许可证
 

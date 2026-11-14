@@ -35,11 +35,20 @@ describe('包入口（dist 产物）', () => {
   });
 
   it('包名 @aster-cloud/aster-guard 经 exports 解析到 GuardClient 与 VERSION', () => {
-    expect(exportedNames('@aster-cloud/aster-guard').sort()).toEqual(['GuardClient', 'VERSION']);
+    expect(exportedNames('@aster-cloud/aster-guard').sort()).toEqual(['GuardClient', 'JcsError', 'VERSION', 'canonicalize', 'hashAction', 'jcsSha256', 'parseStrictJson']);
   });
 
   it('子路径 @aster-cloud/aster-guard/mcp 经 exports 解析，运行时只导出 createGuardProxyServer', () => {
     expect(exportedNames('@aster-cloud/aster-guard/mcp')).toEqual(['createGuardProxyServer']);
+  });
+
+  it('子路径 @aster-cloud/aster-guard/tool 导出 consume 票据核对（auth 隔离，ADR 0054 §3.3）', () => {
+    expect(exportedNames('@aster-cloud/aster-guard/tool').sort()).toEqual([
+      'CONSUME_TICKET_META_KEY',
+      'DEFAULT_TICKET_TTL_MS',
+      'MemoryAttemptLedger',
+      'verifyConsumeTicket',
+    ]);
   });
 
   it('发布前先构建：prepublishOnly 运行 build，手动 pnpm publish 不会带上陈旧或缺失的 dist/', () => {
@@ -47,7 +56,7 @@ describe('包入口（dist 产物）', () => {
   });
 
   it('exports 的每个条件都指向已构建的文件；./mcp 的类型声明含选项与返回类型', () => {
-    expect(Object.keys(pkg.exports)).toEqual(['.', './mcp']);
+    expect(Object.keys(pkg.exports)).toEqual(['.', './mcp', './tool']);
     for (const conditions of Object.values(pkg.exports)) {
       expect(Object.keys(conditions)[0]).toBe('types');
       for (const target of Object.values(conditions)) {
