@@ -17,6 +17,11 @@ export function mockGuard() {
     listApprovals: vi.fn<GuardClientLike['listApprovals']>(),
     approve: vi.fn<GuardClientLike['approve']>(),
     reject: vi.fn<GuardClientLike['reject']>(),
+    run: vi.fn<GuardClientLike['run']>(),
+    consume: vi.fn<GuardClientLike['consume']>(),
+    reportResult: vi.fn<GuardClientLike['reportResult']>(),
+    verifyReceipt: vi.fn<GuardClientLike['verifyReceipt']>(),
+    keys: vi.fn<GuardClientLike['keys']>(),
   };
 }
 

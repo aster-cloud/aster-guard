@@ -45,7 +45,10 @@ jobs:
       - name: Run tests
         run: pnpm run test
 
-  # CI 通过后才发布到 npm（Trusted Publisher + provenance）
+      - name: Build
+        run: pnpm run build
+
+  # CI 通过后才发布到 npm：组织级 NPM_TOKEN + provenance（aster-api ADR 0054 §11 D6；仓库公开，OIDC 产出 provenance 证明）
   publish:
     needs: ci
     runs-on: ubuntu-latest
@@ -85,8 +88,23 @@ jobs:
             exit 1
           fi
 
-      - name: Publish to npm (Trusted Publisher)
-        run: pnpm publish --no-git-checks --provenance
+      # npm 上已有该版本时跳过发布（重跑同一 tag 保持绿色），仍创建 GitHub Release。
+      - name: Check whether version is already published
+        id: published
+        run: |
+          PKG="$(node -p "require('./package.json').name")@$(node -p "require('./package.json').version")"
+          if npm view "$PKG" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$PKG 已在 npm 上，跳过发布"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm (org NPM_TOKEN + provenance)
+        if: steps.published.outputs.exists != 'true'
+        run: pnpm publish --no-git-checks --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3

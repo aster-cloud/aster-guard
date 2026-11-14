@@ -1,7 +1,10 @@
 // aster-guard-mcp 的命令行配置：解析 argv 与环境变量，用 zod 校验后得到 ProxyConfig（ADR 0040 §6）。
+import { readFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import type { GuardPrincipal } from '../types.js';
+import type { ActionMapping } from './action-mapping.js';
 import { hasControlChar, MAX_ROLES, MAX_TEXT_LENGTH } from './action-limits.js';
 
 /** 缺省的 API key 环境变量名。API key 只从环境变量读取，不接受命令行传入（argv 对同机其他进程可见）。 */
@@ -41,6 +44,18 @@ guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject
   --resource-from <argName>     取该工具参数的值作为 resource.id（resource.type 为 arg）；
                                 超过 ${MAX_TEXT_LENGTH} 字符或含控制字符时改用 sha256:<hex>
   --agent-model <model>         写入 action.agent.model 的模型名
+
+执行点（有 --upstream 时；ADR 0054 §2–§3，R66）：
+  --tenant-id <id>              API key 所属租户（必填）：执行收据的 payload.tenantId 须与之相等
+  --isolation network|auth      原始工具端点的隔离方式（必填，配置自述，由部署层绕过测试验证）：
+                                network = 上游只接受来自代理的连接（stdio 子进程天然满足）；
+                                auth    = 转发时在 params._meta["io.aster/guard-consume"] 附 consume 票据，
+                                          上游工具用 @aster-cloud/aster-guard/tool 的 verifyConsumeTicket 核对
+  --tools <a,b>                 工具白名单：只有列出的上游工具出现在 tools/list 且可调用（覆盖配置文件 tools）；
+                                未配置则全部暴露并在启动时告警
+  --config <file.json>          配置文件 { "tools": [...], "actions": { "<tool>": { "resourceFrom", "digestArgs", "actionName" } } }；
+                                未知键报错；actions 里的工具须在白名单内
+  --executor-id <id>            对账用执行方标识，缺省 aster-guard-mcp@<hostname>（≤ 255 字符、无控制字符）
   -h, --help                    显示本帮助
 
 --principal-id / --principal-type / --agent-model 与每个角色须为 1–${MAX_TEXT_LENGTH} 字符且不含控制字符
@@ -72,6 +87,16 @@ export interface ProxyConfig {
   upstreamTimeoutMs: number;
   resourceFromArg?: string;
   agentModel?: string;
+  /** 有上游时必填：收据租户核对。 */
+  tenantId?: string;
+  /** 对账用执行方标识（ADR 0054 §5）。 */
+  executorId: string;
+  /** 有上游时必填：隔离方式自述。 */
+  isolation?: 'network' | 'auth';
+  /** 工具白名单；缺省全部暴露。 */
+  tools?: string[];
+  /** 按工具的 action 映射。 */
+  actions: Record<string, ActionMapping>;
 }
 
 const OPTIONS = {
@@ -86,6 +111,11 @@ const OPTIONS = {
   'upstream-timeout': { type: 'string' },
   'resource-from': { type: 'string' },
   'agent-model': { type: 'string' },
+  'tenant-id': { type: 'string' },
+  'executor-id': { type: 'string' },
+  isolation: { type: 'string' },
+  tools: { type: 'string' },
+  config: { type: 'string' },
   help: { type: 'boolean', short: 'h' },
 } as const;
 
@@ -151,7 +181,41 @@ const CliSchema = z.object({
     .optional(),
   'resource-from': optionalText('resource-from'),
   'agent-model': actionText(z.string().trim().min(1, '--agent-model 不能为空'), '--agent-model').optional(),
+  'tenant-id': actionText(z.string().trim().min(1, '--tenant-id 不能为空'), '--tenant-id').optional(),
+  'executor-id': z
+    .string()
+    .trim()
+    .min(1, '--executor-id 不能为空')
+    .max(255, '--executor-id 不能超过 255 个字符')
+    .refine((value) => !hasControlChar(value), '--executor-id 不能含控制字符')
+    .optional(),
+  isolation: z.enum(['network', 'auth'], { error: '--isolation 须为 network 或 auth' }).optional(),
+  tools: z
+    .string()
+    .transform((value) => value.split(',').map((t) => t.trim()).filter((t) => t !== ''))
+    .pipe(z.array(z.string()).min(1, '--tools 不能为空'))
+    .optional(),
+  config: optionalText('config'),
 });
+
+/** 配置文件：严格模式，未知键报错。 */
+const MappingSchema = z
+  .object({
+    resourceFrom: z.string().min(1).optional(),
+    digestArgs: z
+      .array(z.string().min(1, 'digestArgs 的每一项须为非空字符串'))
+      .transform((keys) => [...new Set(keys)])
+      .pipe(z.array(z.string()).min(1, 'digestArgs 不能为空'))
+      .optional(),
+    actionName: actionText(z.string().trim().min(1, 'actionName 不能为空'), 'actionName').optional(),
+  })
+  .strict();
+const ConfigFileSchema = z
+  .object({
+    tools: z.array(z.string().min(1)).min(1).optional(),
+    actions: z.record(z.string(), MappingSchema).optional(),
+  })
+  .strict();
 
 /** argv 中是否请求帮助。宽松解析：即使其他参数缺失或非法也能识别 --help / -h。 */
 export function wantsHelp(argv: readonly string[]): boolean {
@@ -175,6 +239,7 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
     throw new ConfigError(`环境变量 ${apiKeyEnv} 未设置 API key`);
   }
   const [policyModule, policyFunction] = options.policy.split('/');
+  const execution = executionConfig(options);
   const roles = options['principal-roles'];
   return {
     ...(options.upstream === undefined ? {} : { upstream: parseUpstream(options.upstream) }),
@@ -192,7 +257,48 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
     upstreamTimeoutMs: (options['upstream-timeout'] ?? DEFAULT_UPSTREAM_TIMEOUT_SECONDS) * 1000,
     ...(options['resource-from'] === undefined ? {} : { resourceFromArg: options['resource-from'] }),
     ...(options['agent-model'] === undefined ? {} : { agentModel: options['agent-model'] }),
+    ...execution,
   };
+}
+
+type CliOptions = z.infer<typeof CliSchema>;
+
+/** 执行点相关配置：只在有上游时允许；有上游时 --tenant-id 与 --isolation 必填。 */
+function executionConfig(options: CliOptions): Pick<ProxyConfig, 'tenantId' | 'executorId' | 'isolation' | 'tools' | 'actions'> {
+  const executorId = options['executor-id'] ?? `aster-guard-mcp@${hostname()}`;
+  if (options.upstream === undefined) {
+    const misplaced = (['tenant-id', 'isolation', 'tools', 'config'] as const).filter((k) => options[k] !== undefined);
+    if (misplaced.length > 0) {
+      throw new ConfigError(`${misplaced.map((k) => `--${k}`).join(' / ')} 只用于代理模式（需同时指定 --upstream）`);
+    }
+    return { executorId, actions: {} };
+  }
+  if (options['tenant-id'] === undefined) throw new ConfigError('代理模式缺少必填参数 --tenant-id');
+  if (options.isolation === undefined) throw new ConfigError('代理模式缺少必填参数 --isolation（network 或 auth）');
+  const file = options.config === undefined ? {} : readConfigFile(options.config);
+  const tools = options.tools ?? file.tools;
+  const actions = file.actions ?? {};
+  const outside = Object.keys(actions).filter((tool) => tools !== undefined && !tools.includes(tool));
+  if (outside.length > 0) {
+    throw new ConfigError(`actions 中的工具不在白名单内：${outside.join(', ')}`);
+  }
+  return { tenantId: options['tenant-id'], executorId, isolation: options.isolation, ...(tools ? { tools } : {}), actions };
+}
+
+function readConfigFile(path: string): z.infer<typeof ConfigFileSchema> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (e) {
+    throw new ConfigError(`无法读取配置文件 ${path}：${e instanceof Error ? e.message : String(e)}`);
+  }
+  const parsed = ConfigFileSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ConfigError(
+      [`配置文件 ${path} 有误：`, ...parsed.error.issues.map((i) => `  - ${i.path.join('.') || '(根)'}：${i.message}`)].join('\n'),
+    );
+  }
+  return parsed.data;
 }
 
 /** 严格解析：未知参数、多余的位置参数、缺值的参数都转为 ConfigError。 */

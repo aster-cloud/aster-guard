@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { fakeApi, TENANT } from './fixtures/fake-api.js';
 import { runNode, UUID } from './helpers.js';
 
 // CLI 端到端：以子进程运行构建产物 dist/mcp/cli.js（由 pnpm test 先 build 保证），
@@ -26,38 +27,34 @@ let guardServer: HttpServer;
 let baseUrl: string;
 const guardRequests: GuardRequest[] = [];
 
-/** 与 aster-api GuardActionMapper 相同的 context 校验：含 null 值或序列化超过 65536 字节即 400 invalid_action。 */
-function contextViolation(context: unknown): string | undefined {
-  if (containsNull(context)) return 'context 不允许 null 值';
-  if (Buffer.byteLength(JSON.stringify(context ?? {})) > 65_536) return 'context 超过 65536 字节';
-  return undefined;
-}
-
-function containsNull(value: unknown): boolean {
-  if (value === null) return true;
-  return typeof value === 'object' && Object.values(value as object).some(containsNull);
-}
-
-/** mock guard：context 违反服务端限制时 400；context.deny 为 true 时 DENY，否则 ALLOW。 */
+/**
+ * 假 aster-api（真实签收据）挂在本地 HTTP 上：context.deny 为 true 时 DENY；序列化超过 65536 字节的 context 400。
+ * 只记录 /decisions 请求。
+ */
 beforeAll(async () => {
+  const api = fakeApi();
+  api.override((req) => {
+    if (req.path !== '/api/v1/guard/decisions') return undefined;
+    const context = ((req.body as GuardRequest['body']).action?.context ?? {}) as Record<string, unknown>;
+    if (Buffer.byteLength(JSON.stringify(context)) > 65_536) {
+      return new Response(JSON.stringify({ error: 'invalid_action', message: 'context 超过 65536 字节' }), { status: 400 });
+    }
+    if (context.deny === true) {
+      const decision = { decisionId: 'd-deny', outcome: 'DENY', effectiveOutcome: 'DENY', reason: 'blocked in test' };
+      return new Response(JSON.stringify(decision), { status: 200 });
+    }
+    return undefined;
+  });
   guardServer = createServer((req, res) => {
     let raw = '';
     req.on('data', (chunk) => (raw += chunk));
-    req.on('end', () => {
-      const body = JSON.parse(raw || '{}') as GuardRequest['body'];
-      guardRequests.push({ method: req.method ?? '', url: req.url ?? '', headers: req.headers, body });
-      const context = (body.action?.context ?? {}) as Record<string, unknown>;
-      const violation = contextViolation(context);
-      if (violation) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'invalid_action', message: violation }));
-        return;
+    req.on('end', async () => {
+      const headers = Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, String(v)]));
+      if (req.url === '/api/v1/guard/decisions') {
+        guardRequests.push({ method: req.method ?? '', url: req.url, headers: req.headers, body: JSON.parse(raw || '{}') });
       }
-      const decision =
-        context.deny === true
-          ? { decisionId: 'd-deny', outcome: 'DENY', effectiveOutcome: 'DENY', reason: 'blocked in test' }
-          : { decisionId: 'd-allow', outcome: 'ALLOW', effectiveOutcome: 'ALLOW' };
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(decision));
+      const response = await api.fetch(`http://fake${req.url}`, { method: req.method, headers, body: raw === '' ? undefined : raw });
+      res.writeHead(response.status, { 'Content-Type': 'application/json' }).end(await response.text());
     });
   });
   guardServer.listen(0, '127.0.0.1');
@@ -72,6 +69,11 @@ afterAll(async () => {
 
 function requiredArgs(): string[] {
   return ['--base-url', baseUrl, '--policy', 'guard.test/decide', '--principal-id', 'agent-e2e'];
+}
+
+/** 代理模式的执行点参数（ADR 0054 R66 D8）。 */
+function proxyArgs(...extra: string[]): string[] {
+  return [...requiredArgs(), '--tenant-id', TENANT, '--isolation', 'network', ...extra];
 }
 
 /** 运行 CLI 直到其 stdio 全部关闭；stdin 关闭时机见 runNode。 */
@@ -97,7 +99,7 @@ describe('aster-guard-mcp CLI：参数', { timeout: CLI_TEST_TIMEOUT_MS }, () =>
 
   it('上游无法启动 → stderr 报错，退出码 1', async () => {
     const { code, stdout, stderr } = await runCli(
-      [...requiredArgs(), '--upstream', '/nonexistent/upstream-binary --x'],
+      [...proxyArgs(), '--upstream', '/nonexistent/upstream-binary --x'],
       { ASTER_GUARD_API_KEY: 'ak_e2e' },
     );
     expect(code).toBe(1);
@@ -110,7 +112,7 @@ describe('aster-guard-mcp CLI：端到端代理', { timeout: CLI_TEST_TIMEOUT_MS
   it('透传 tools/list，ALLOW 转发、DENY 拦截；上游看不到 guard API key', async () => {
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: [CLI, ...requiredArgs(), '--upstream', UPSTREAM, '--resource-from', 'text'],
+      args: [CLI, ...proxyArgs(), '--upstream', UPSTREAM, '--resource-from', 'text'],
       env: { PATH: process.env.PATH ?? '', ASTER_GUARD_API_KEY: 'ak_e2e', UPSTREAM_MARKER: 'visible' },
       stderr: 'pipe',
     });
@@ -128,6 +130,8 @@ describe('aster-guard-mcp CLI：端到端代理', { timeout: CLI_TEST_TIMEOUT_MS
       const denied = await agent.callTool({ name: 'echo', arguments: { text: 'no', deny: true } });
       expect(denied.isError).toBe(true);
       expect(denied.content).toEqual([{ type: 'text', text: 'Blocked by Aster Guard: blocked in test (decision d-deny)' }]);
+      expect(denied._meta?.asterGuard).toMatchObject({ status: 'denied', decisionId: 'd-deny' });
+      expect((allowed._meta?.asterGuard as { decisionId: string }).decisionId).toMatch(UUID);
 
       const probe = await agent.callTool({ name: 'env_probe', arguments: {} });
       expect(JSON.parse((probe.content as Array<{ text: string }>)[0].text)).toEqual({
@@ -157,10 +161,10 @@ describe('aster-guard-mcp CLI：端到端代理', { timeout: CLI_TEST_TIMEOUT_MS
     }
   });
 
-  it('工具参数里的 null 在 check 前被剔除，服务端校验通过而 ALLOW；上游收到原始参数；超大 context 被服务端拒绝', async () => {
+  it('null 原样保留（不再剔除）且与上游收到的参数同一规范化对象；超大 context 被服务端拒绝 → blocked', async () => {
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: [CLI, ...requiredArgs(), '--upstream', UPSTREAM],
+      args: [CLI, ...proxyArgs(), '--upstream', UPSTREAM],
       env: { PATH: process.env.PATH ?? '', ASTER_GUARD_API_KEY: 'ak_e2e' },
       stderr: 'pipe',
     });
@@ -170,15 +174,13 @@ describe('aster-guard-mcp CLI：端到端代理', { timeout: CLI_TEST_TIMEOUT_MS
       guardRequests.length = 0;
       const allowed = await agent.callTool({ name: 'echo', arguments: { text: 'hi', note: null, tags: ['a', null] } });
       expect(allowed.isError).toBeFalsy();
-      expect(allowed.content).toEqual([{ type: 'text', text: '{"text":"hi","note":null,"tags":["a",null]}' }]);
+      expect(allowed.content).toEqual([{ type: 'text', text: '{"note":null,"tags":["a",null],"text":"hi"}' }]);
       expect(guardRequests).toHaveLength(1);
-      expect(guardRequests[0].body.action.context).toEqual({ text: 'hi', tags: ['a'] });
+      expect(guardRequests[0].body.action.context).toEqual({ note: null, tags: ['a', null], text: 'hi' });
 
       const oversize = await agent.callTool({ name: 'echo', arguments: { text: 'x'.repeat(70_000) } });
       expect(oversize.isError).toBe(true);
-      expect(oversize.content).toEqual([
-        { type: 'text', text: 'Blocked by Aster Guard: context 超过 65536 字节 (decision n/a)' },
-      ]);
+      expect(oversize._meta?.asterGuard).toMatchObject({ status: 'blocked', reasonCode: 'http_400' });
     } finally {
       await agent.close();
     }
@@ -207,7 +209,6 @@ describe('aster-guard-mcp CLI：端到端代理', { timeout: CLI_TEST_TIMEOUT_MS
       const result = await agent.callTool({ name: 'guard_check', arguments: { action: { name: 'send_email' } } });
       expect(result.isError).toBe(false);
       expect(JSON.parse((result.content as Array<{ text: string }>)[0].text)).toMatchObject({
-        decisionId: 'd-allow',
         effectiveOutcome: 'ALLOW',
       });
       expect(guardRequests).toHaveLength(1);
@@ -223,7 +224,7 @@ describe('aster-guard-mcp CLI：端到端代理', { timeout: CLI_TEST_TIMEOUT_MS
 
   it('下游关闭 stdin → 关闭上游子进程并以 0 退出', async () => {
     const { code, stderr } = await runCli(
-      [...requiredArgs(), '--upstream', UPSTREAM],
+      [...proxyArgs(), '--upstream', UPSTREAM],
       { ASTER_GUARD_API_KEY: 'ak_e2e' },
       /代理模式已启动/,
     );
@@ -235,7 +236,7 @@ describe('aster-guard-mcp CLI：端到端代理', { timeout: CLI_TEST_TIMEOUT_MS
 
   it('上游意外退出 → stderr 报告并以 1 退出', async () => {
     const { code, stderr } = await runCli(
-      [...requiredArgs(), '--upstream', UPSTREAM],
+      [...proxyArgs(), '--upstream', UPSTREAM],
       { ASTER_GUARD_API_KEY: 'ak_e2e', ECHO_UPSTREAM_EXIT_AFTER_MS: '1000' },
       'never',
     );

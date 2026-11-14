@@ -1,8 +1,7 @@
-// aster-guard-mcp 的 MCP 服务器（ADR 0040 §6）。
-// 有上游：原样转发 tools/list，拦截每一次 tools/call 先过 guard，只有服务端确认的 ALLOW 才转发；
+// aster-guard-mcp 的 MCP 服务器（ADR 0040 §6、ADR 0054 §2.2）。
+// 有上游：每一次 tools/call 经 GuardClient.run 按固定顺序「哈希 → 决策 → 验签 → consume → 转发 → 回写」执行，
+// 任一步失败不转发；DENY / PENDING / 阻断返回结构化载荷（guard-result.ts）。
 // 无上游：只提供五个治理工具（standalone-tools.ts）。两种模式共用同一个低层 Server，上游工具 schema 原样透传。
-// 幂等键用全局 crypto.randomUUID（与 GuardClient 一致）；node:crypto 只用于 resource.id 的哈希。
-import { createHash } from 'node:crypto';
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import {
@@ -17,9 +16,13 @@ import {
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { GuardClient } from '../client.js';
+import { JcsError, jcsSha256 } from '../hash/jcs.js';
 import { VERSION } from '../index.js';
-import type { GuardAction, GuardDecision, GuardPrincipal } from '../types.js';
-import { isActionText } from './action-limits.js';
+import { BEFORE_CONSUME } from '../internal/hooks.js';
+import type { GuardGrant, GuardPrincipal, GuardRunOptions } from '../types.js';
+import { CONSUME_TICKET_META_KEY } from '../tool/consume-ticket.js';
+import { buildToolAction, canonicalArgs, envelopeOf, type ActionMapping } from './action-mapping.js';
+import { blockedResult, pendingResult, refusedResult, withGuardMeta } from './guard-result.js';
 import { callGovernanceTool, GOVERNANCE_TOOLS } from './standalone-tools.js';
 
 /** 缺省的人工审批等待时长（§6：`--approval-timeout` 缺省 300 秒）。 */
@@ -38,7 +41,10 @@ const MAX_TIMER_MS = 2_147_483_647;
 const MAX_TOOL_LIST_PAGES = 100;
 
 /** 代理用到的 GuardClient 方法（便于注入 mock）。 */
-export type GuardClientLike = Pick<GuardClient, 'check' | 'get' | 'waitFor' | 'listApprovals' | 'approve' | 'reject'>;
+export type GuardClientLike = Pick<
+  GuardClient,
+  'check' | 'get' | 'waitFor' | 'listApprovals' | 'approve' | 'reject' | 'run' | 'consume' | 'reportResult' | 'verifyReceipt' | 'keys'
+>;
 
 /** 代理用到的上游 Client 方法；代理接管其生命周期，close() 时一并关闭。 */
 export type UpstreamClient = Pick<Client, 'listTools' | 'callTool' | 'close'>;
@@ -60,6 +66,16 @@ export interface GuardProxyOptions {
   resourceFromArg?: string;
   /** 写入 `action.agent.model`。 */
   agentModel?: string;
+  /** 对账用执行方标识；缺省由 GuardClient.run 取 `aster-guard-sdk@<hostname>`，CLI 传 `aster-guard-mcp@<hostname>`。 */
+  executorId?: string;
+  /** 隔离方式；`auth` 时转发请求附 consume 票据。 */
+  isolation?: 'network' | 'auth';
+  /** 工具白名单；缺省全部上游工具。 */
+  tools?: string[];
+  /** 按工具的 action 映射。 */
+  actions?: Record<string, ActionMapping>;
+  /** 仅测试：consume 之前调用，入参为将被转发的参数对象（绕过套件 #3）。CLI 不暴露。 */
+  __beforeConsume?: (args: Record<string, unknown>) => void;
 }
 
 /** 缺省值已落定的选项。 */
@@ -111,34 +127,99 @@ function installGovernanceTools(server: Server, options: GuardProxyOptions): voi
 
 function installGuardedUpstream(server: Server, upstream: UpstreamClient, options: ResolvedOptions): void {
   const timeout = options.upstreamTimeoutMs;
+  const allow = options.tools === undefined ? undefined : new Set(options.tools);
   const knownTools = new UpstreamToolNames(upstream, timeout);
+  const exposed = (tool: Tool) => allow === undefined || allow.has(tool.name);
 
   server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
     const result = await upstream.listTools(request.params, { signal: extra.signal, timeout });
     knownTools.remember(result.tools);
-    return result;
+    return { ...result, tools: result.tools.filter(exposed) };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    const { name, arguments: args } = request.params;
-    if (!(await knownTools.has(name))) {
+    const { name } = request.params;
+    const tool = allow === undefined || allow.has(name) ? await knownTools.get(name) : undefined;
+    if (!tool) {
       throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
     }
-    const decision = await decide(options, toAction(options, name, args), extra.signal);
-    // 下游已取消（例如客户端等审批等到超时）时，结论来得再晚也不执行副作用——调用方已放弃，
-    // 执行了它也不知道，重试就会重复执行；SDK 也不会再发送这次响应。
-    if (!isConfirmedAllow(decision) || extra.signal.aborted) {
-      return blocked(decision);
+    const hasOutputSchema = tool.outputSchema !== undefined;
+    let args: Record<string, unknown>;
+    try {
+      args = canonicalArgs(request.params.arguments);
+    } catch (e) {
+      if (!(e instanceof JcsError)) throw e;
+      return blockedResult(clientBlocked(`参数无法按 jcs-sha256/v1 规范化（${e.code}）：${e.message}`), hasOutputSchema);
     }
-    // 传入 signal：转发期间下游取消时，把取消传给上游。超时到时 SDK 以 McpError(RequestTimeout) 拒绝，
-    // 经本处理函数抛出，下游收到协议错误而不是成功结果。
-    return upstream.callTool({ name, arguments: args }, undefined, {
-      signal: extra.signal,
-      timeout,
-      resetTimeoutOnProgress: true,
-      onprogress: relayProgress(server, request.params._meta?.progressToken, extra.sendNotification),
+    const mapping = options.actions?.[name];
+    const action = buildToolAction({
+      toolName: name,
+      args,
+      mapping,
+      defaultResourceFrom: options.resourceFromArg,
+      principal: options.principal,
+      agentModel: options.agentModel,
     });
+    const forward = (grant: GuardGrant) =>
+      upstream.callTool(
+        {
+          name,
+          arguments: args,
+          ...(options.isolation === 'auth'
+            ? { _meta: { [CONSUME_TICKET_META_KEY]: { decisionId: grant.decisionId, attemptId: grant.attemptId, envelope: envelopeOf(action) } } }
+            : {}),
+        },
+        undefined,
+        {
+          signal: extra.signal,
+          timeout,
+          resetTimeoutOnProgress: true,
+          onprogress: relayProgress(server, request.params._meta?.progressToken, extra.sendNotification),
+        },
+      ) as Promise<CallToolResult>;
+    const runOptions: GuardRunOptions<CallToolResult> & { [BEFORE_CONSUME]?: () => void } = {
+      approvalTimeoutMs: options.approvalTimeoutMs,
+      signal: extra.signal,
+      classify: classifyUpstream,
+      ...(options.executorId === undefined ? {} : { executorId: options.executorId }),
+      ...(options.__beforeConsume ? { [BEFORE_CONSUME]: () => options.__beforeConsume?.(args) } : {}),
+    };
+    let grant: GuardGrant | undefined;
+    const outcome = await options.client.run(
+      action,
+      (g) => {
+        grant = g;
+        return forward(g);
+      },
+      runOptions,
+    );
+    switch (outcome.kind) {
+      case 'executed':
+        return withGuardMeta(outcome.result, grant ?? outcome);
+      case 'pending':
+        return pendingResult(outcome.decision, hasOutputSchema);
+      case 'blocked':
+        return refusedResult(outcome.decision, hasOutputSchema);
+      case 'failed':
+        // 上游协议错误 / 超时：已回写 failed，原样抛给下游（协议错误而不是成功结果）。
+        throw outcome.error;
+    }
   });
+}
+
+/** 上游结果归类：isError → failed；resultHash 为 content 的 jcs-sha256/v1（无法规范化时省略）。 */
+function classifyUpstream(result: CallToolResult): { status: 'executed' | 'failed'; errorCode?: string; resultHash?: string } {
+  let resultHash: string | undefined;
+  try {
+    resultHash = jcsSha256(result.content);
+  } catch {
+    resultHash = undefined;
+  }
+  return result.isError ? { status: 'failed', errorCode: 'tool_error', resultHash } : { status: 'executed', resultHash };
+}
+
+function clientBlocked(reason: string) {
+  return { decisionId: '', outcome: 'DENY' as const, effectiveOutcome: 'DENY' as const, reasonCode: 'client_error', reason };
 }
 
 /**
@@ -166,7 +247,7 @@ function relayProgress(
  * 并发的未命中共享同一次刷新。
  */
 class UpstreamToolNames {
-  private readonly names = new Set<string>();
+  private readonly names = new Map<string, Tool>();
   private refreshing: Promise<void> | undefined;
 
   constructor(
@@ -175,14 +256,16 @@ class UpstreamToolNames {
   ) {}
 
   remember(tools: Tool[]): void {
-    for (const tool of tools) this.names.add(tool.name);
+    for (const tool of tools) this.names.set(tool.name, tool);
   }
 
-  async has(name: string): Promise<boolean> {
-    if (this.names.has(name)) return true;
+  /** 取工具定义（含 outputSchema）；未知工具为 undefined。 */
+  async get(name: string): Promise<Tool | undefined> {
+    const cached = this.names.get(name);
+    if (cached) return cached;
     this.refreshing ??= this.refresh().finally(() => (this.refreshing = undefined));
     await this.refreshing;
-    return this.names.has(name);
+    return this.names.get(name);
   }
 
   /** 翻完上游全部分页；游标重复或超过 MAX_TOOL_LIST_PAGES 页即停止，已收集的工具名照常生效。 */
@@ -197,86 +280,4 @@ class UpstreamToolNames {
       seen.add(cursor);
     }
   }
-}
-
-/**
- * 由一次 tools/call 构造 Action：action.name 为工具名，context 为剔除 null 后的工具参数（§6）。
- * 转发给上游的仍是原始参数，规整只作用于提交给 guard 的 Action。
- */
-function toAction(options: GuardProxyOptions, name: string, args: Record<string, unknown> | undefined): GuardAction {
-  const { principal, resourceFromArg, agentModel } = options;
-  const resourceId = resourceFromArg === undefined ? undefined : args?.[resourceFromArg];
-  return {
-    principal,
-    action: { name },
-    resource: resourceId == null ? undefined : { type: 'arg', id: resourceIdText(resourceId) },
-    context: withoutNullEntries(args ?? {}),
-    agent: agentModel ? { model: agentModel } : undefined,
-  };
-}
-
-/**
- * 递归剔除值为 null / undefined 的键与数组元素。服务端 context 不接受 null 值（整次请求 400），
- * 而宿主与模型常以 null 表示「未提供的可选参数」；对规则而言 null 与缺省等价。
- */
-function withoutNullEntries(record: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(
-    Object.entries(record)
-      .filter(([, value]) => value != null)
-      .map(([key, value]) => [key, withoutNulls(value)]),
-  );
-}
-
-function withoutNulls(value: unknown): unknown {
-  if (Array.isArray(value)) return value.filter((item) => item != null).map(withoutNulls);
-  if (typeof value === 'object' && value !== null) return withoutNullEntries(value as Record<string, unknown>);
-  return value;
-}
-
-/**
- * resource.id 的文本：字符串、数字、布尔按 String()；对象与数组用 JSON，避免不同资源都变成 "[object Object]"
- * 而共用一个 id。结果超出服务端文本字段限制（> 255 字符或含控制字符）时改用 `sha256:<hex>`：
- * 同一资源得到同一 id，且不会让整次请求被服务端拒绝。
- */
-function resourceIdText(value: unknown): string {
-  const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
-  return isActionText(text) ? text : `sha256:${createHash('sha256').update(text).digest('hex')}`;
-}
-
-/**
- * 取得最终结论：check；PENDING 则 waitFor 到 approvalTimeoutMs。signal 为这次 tools/call 的取消信号，
- * 下游取消后 waitFor 随之停止轮询。
- *
- * 每次 tools/call 用新的 UUID 作幂等键：键只代表这一次动作尝试，绝不从 JSON-RPC 请求 id 派生——
- * 后者在重连或换会话后会重复，让不同动作撞键（§6）。GuardClient 约定对 guard 结果不抛异常；注入的实现若抛出，
- * 同样按 fail-closed 处理为 DENY，并保留已知的 PENDING decisionId 便于追查。
- */
-async function decide(options: ResolvedOptions, action: GuardAction, signal: AbortSignal): Promise<GuardDecision> {
-  const { client, approvalTimeoutMs } = options;
-  let decisionId = '';
-  try {
-    const decision = await client.check(action, { idempotencyKey: crypto.randomUUID() });
-    if (decision.effectiveOutcome !== 'PENDING') return decision;
-    decisionId = decision.decisionId;
-    return await client.waitFor(decisionId, { timeoutMs: approvalTimeoutMs, signal });
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    return { decisionId, outcome: 'DENY', effectiveOutcome: 'DENY', reasonCode: 'client_error', reason };
-  }
-}
-
-/**
- * 只有服务端确认的 ALLOW 才放行：客户端 fail-closed 产生的结论（guard 不可达、超时、非 2xx）
- * decisionId 为空串，即使 effectiveOutcome 被误标为 ALLOW 也不转发。
- */
-function isConfirmedAllow(decision: GuardDecision): boolean {
-  return decision.effectiveOutcome === 'ALLOW' && decision.decisionId !== '';
-}
-
-function blocked(decision: GuardDecision): CallToolResult {
-  const why = decision.reason || decision.reasonCode || `effectiveOutcome ${decision.effectiveOutcome}`;
-  return {
-    isError: true,
-    content: [{ type: 'text', text: `Blocked by Aster Guard: ${why} (decision ${decision.decisionId || 'n/a'})` }],
-  };
 }

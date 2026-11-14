@@ -53,6 +53,10 @@ describe('aster-guard-mcp CLI：启动失败', () => {
       'agent-startup',
       '--upstream',
       'fake-upstream',
+      '--tenant-id',
+      'tenant-startup',
+      '--isolation',
+      'network',
     ];
     try {
       await import('../src/mcp/cli.js');

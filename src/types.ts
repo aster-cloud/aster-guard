@@ -59,7 +59,18 @@ export interface GuardReceipt {
  * `receipt_unavailable` 等（§3.2）。
  */
 export interface GuardDecision {
+  /** 回读字段（`GET /decisions/{id}`）：收据已消耗时的 actionHash。 */
+  actionHash?: string;
   approval?: GuardDecisionApproval;
+  /** 回读字段：权威消耗者（已消耗时）。 */
+  consumedBy?: { attemptId: string; consumedAt: string; executorId: string };
+  /** ALLOW 决策的执行收据（ADR 0040 §12 D1）；执行前必须验签并 consume。 */
+  executionReceipt?: ExecutionReceipt;
+  /** 回读字段：决策评估的策略地址（ADR 0054 §11 D12）。 */
+  policyFunction?: string;
+  policyModule?: string;
+  /** 回读字段：结果回写状态。 */
+  result?: { resultAt?: string; status: string };
   controls?: string[];
   decisionId: string;
   effectiveOutcome: GuardEffectiveOutcome;
@@ -248,4 +259,97 @@ export interface GuardClientOptions {
   sleep?: (ms: number) => Promise<void>;
   /** waitFor 使用的时钟（毫秒），供测试注入，默认 `Date.now`。 */
   now?: () => number;
+  /**
+   * API key 所属租户。`run` 与 `verifyReceipt` 用它核对收据的 `payload.tenantId`；缺失时二者抛 TypeError（编程错误）。
+   */
+  tenantId?: string;
+}
+
+/** 执行收据的被签载荷（字段字母序，与 aster-api 一致）。 */
+export interface ExecutionReceiptPayload {
+  actionHash: string;
+  decisionId: string;
+  expiresAt: string;
+  issuedAt: string;
+  kid: string;
+  outcome: 'ALLOW';
+  policyVersionId?: number;
+  tenantId: string;
+  v: 1;
+}
+
+/** 执行收据（ADR 0040 §12 D1）：签名为 Ed25519 对 `payload` 的 JCS 字节，base64url。 */
+export interface ExecutionReceipt {
+  kid: string;
+  payload: ExecutionReceiptPayload;
+  revision: number;
+  signature: string;
+}
+
+/** `GET /api/v1/guard/keys` 的一把公钥。 */
+export interface GuardJwk {
+  alg: 'EdDSA';
+  crv: 'Ed25519';
+  kid: string;
+  kty: 'OKP';
+  use: 'sig';
+  x: string;
+  exp?: number;
+}
+
+/** 收据核对失败的细分原因（对外 reasonCode 统一为 `receipt_invalid`）。 */
+export type ReceiptInvalidDetail =
+  | 'malformed'
+  | 'kid_unknown'
+  | 'bad_signature'
+  | 'tenant_mismatch'
+  | 'decision_mismatch'
+  | 'not_allow'
+  | 'outside_window'
+  | 'action_hash_mismatch'
+  | 'policy_mismatch'
+  | 'keys_unavailable';
+
+/** 收据核对结果。 */
+export type ReceiptCheck = { ok: true } | { ok: false; reasonCode: 'receipt_invalid'; detail: ReceiptInvalidDetail };
+
+/** consume 成功后交给执行回调的授权凭据。 */
+export interface GuardGrant {
+  decisionId: string;
+  attemptId: string;
+  actionHash: string;
+}
+
+/** `run` 的选项；没有任何跳过验签 / consume 的开关（ADR 0054 §2.1）。 */
+export interface GuardRunOptions<T> {
+  /** `<component>@<host-or-pod>[:<instance>]`，≤ 255 字符、无控制字符；缺省 `aster-guard-sdk@<hostname>`。 */
+  executorId?: string;
+  /** PENDING 时等待审批的毫秒数，缺省 300000；到时返回 `pending`。 */
+  approvalTimeoutMs?: number;
+  /** 调用方取消：consume 之后、回调之前中止 → 不执行，回写 aborted。 */
+  signal?: AbortSignal;
+  /** 把回调返回值归类为 executed / failed（如工具返回业务错误）；缺省一律 executed。 */
+  classify?: (result: T) => { status: 'executed' | 'failed'; errorCode?: string; resultHash?: string };
+}
+
+/** `run` 的结局。 */
+export type GuardRunOutcome<T> =
+  | { kind: 'executed'; decisionId: string; attemptId: string; result: T }
+  | { kind: 'blocked'; decision: GuardDecision }
+  | { kind: 'pending'; decision: GuardDecision }
+  | { kind: 'failed'; decisionId: string; attemptId: string; error: unknown };
+
+/** 结果回写的状态。 */
+export type GuardResultStatus = 'executed' | 'failed' | 'aborted';
+
+/** #465 副作用上报的一条（ADR 0054 §10.2）；工具侧 / 业务系统用，代理与 SDK 执行方不上报。 */
+export interface GuardSideEffect {
+  effectId: string;
+  source: string;
+  occurredAt: string;
+  action: { name: string };
+  resource?: { type?: string; id?: string };
+  decisionId?: string;
+  attemptId?: string;
+  actionHash?: string;
 }
