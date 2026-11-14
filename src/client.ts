@@ -167,7 +167,7 @@ export class GuardClient {
   }
 
   /**
-   * 解除原值：只有审批 PENDING 且已验证业务角色包含所需角色者可调用；每人每审批首次解除以本人身份记入审计链。
+   * 解除原值（请求体为空对象 `{}`，与 approve 的空体口径一致）：只有审批 PENDING 且已验证业务角色包含所需角色者可调用；每人每审批首次解除以本人身份记入审计链。
    * 403 `reveal_not_permitted`、409 `input_not_available` / `approval_not_pending`、503 `receipt_unavailable`
    * 以 `{ ok: false }` 返回，响应中不含原值。
    */
@@ -352,15 +352,29 @@ const INPUT_STATUSES: ReadonlySet<unknown> = new Set([
   'too_large',
 ]);
 
-/** 只认已知状态：未知状态的视图不能被当成可审阅的输入。 */
+/**
+ * 只认已知状态：未知状态的视图不能被当成可审阅的输入。`available` 时视图字段与快照哈希必须齐全，
+ * 否则调用方会拿着不完整的视图去审批；其余状态没有输入快照，只要求公共字段。
+ */
 function isApprovalInput(body: unknown): body is GuardApprovalInput {
+  if (
+    !isRecord(body) ||
+    typeof body.approvalId !== 'string' ||
+    typeof body.decisionId !== 'string' ||
+    !INPUT_STATUSES.has(body.status) ||
+    typeof body.maskRules !== 'string' ||
+    typeof body.revealed !== 'boolean' ||
+    typeof body.revealedByMe !== 'boolean'
+  ) {
+    return false;
+  }
   return (
-    isRecord(body) &&
-    typeof body.approvalId === 'string' &&
-    typeof body.decisionId === 'string' &&
-    INPUT_STATUSES.has(body.status) &&
-    typeof body.revealed === 'boolean' &&
-    typeof body.revealedByMe === 'boolean'
+    body.status !== 'available' ||
+    (typeof body.contextHash === 'string' &&
+      typeof body.inputSnapshotHash === 'string' &&
+      typeof body.marksSource === 'string' &&
+      typeof body.inputBinding === 'string' &&
+      isRecord(body.input))
   );
 }
 

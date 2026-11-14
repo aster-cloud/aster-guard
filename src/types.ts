@@ -130,9 +130,12 @@ export interface GuardPiiMark {
 export interface GuardApprovalInput {
   approvalId: string;
   decisionId: string;
+  /** `available` 时必有；修订前的决策（无输入快照）可能缺省。 */
   contextHash?: string;
   status: GuardApprovalInputStatus;
+  /** `available` 时必有；无输入快照的状态下缺省。 */
   marksSource?: 'version' | 'evaluation' | 'none';
+  /** `available` 时必有；无输入快照的状态下缺省。 */
   inputBinding?: 'direct' | 'evaluated' | 'unbound';
   maskRules: string;
   revealed: boolean;

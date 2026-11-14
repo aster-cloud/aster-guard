@@ -87,7 +87,7 @@ switch (decision.effectiveOutcome) {
 审批人可以在审批前查看决策输入的脱敏视图：
 
 - `input` 中 `@pii` 字段为 `{ "$pii": { "level": "L2", "category": "email" } }`，策略未声明的子树为 `{ "$pii": { "level": "unknown" } }`（键名也不展示，任何人都不能解除）。
-- `revealApprovalInput` 只对 `PENDING` 且持有所需业务角色的审批人开放（ESCALATE 不可解除），只还原已声明的 `@pii` 字段；每人每审批首次解除写一条 `ACTION_GUARD_INPUT_REVEAL` 审计事件。失败码：403 `reveal_not_permitted`、409 `input_not_available` / `approval_not_pending`、503 `receipt_unavailable`（此时不返回原值）。
+- `revealApprovalInput` 只对 `PENDING` 且持有所需业务角色的审批人开放（ESCALATE 不可解除），只还原已声明的 `@pii` 字段；每人每审批首次解除写一条 `ACTION_GUARD_INPUT_REVEAL` 审计事件。失败码：403 `reveal_not_permitted`、409 `input_not_available` / `approval_not_pending`、503 `receipt_unavailable`（此时不返回原值）。两个端点对非法 id 与跨租户一律 404 `approval_not_found`。请求体为空对象 `{}`。
 - 批准 / 拒绝时把所见视图的 `inputSnapshotHash` 一并提交，服务端记下 `inputSnapshotMatched` / `inputRevealed`；视图已变化返回 409 `input_snapshot_mismatch`，刷新后重试。
 - `status` 不是 `available`（`unavailable` / `purged` / `integrity_failed` / `too_large`）时没有 `input` 与哈希，照常审批、不带哈希。旧 aster-api 没有该端点（404）时同样按「不可用」处理。
 

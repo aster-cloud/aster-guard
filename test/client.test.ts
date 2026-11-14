@@ -590,13 +590,30 @@ describe('GuardClient 审批输入（aster-api#460，ADR 0042 §12 D8）', () =>
   });
 
   it('不合契约的 200（缺 status / 未知 status）→ client_error', async () => {
-    for (const body of [{ approvalId: 'a-1' }, { ...VIEW, status: 'mystery' }, [VIEW]]) {
+    const withoutHash: Record<string, unknown> = { ...VIEW };
+    delete withoutHash.inputSnapshotHash;
+    const withoutRules: Record<string, unknown> = { ...VIEW };
+    delete withoutRules.maskRules;
+    for (const body of [{ approvalId: 'a-1' }, { ...VIEW, status: 'mystery' }, [VIEW], withoutHash, withoutRules]) {
       const fetchMock = vi.fn(async () => json(200, body));
       await expect(client(fetchMock).getApprovalInput('a-1')).resolves.toMatchObject({
         ok: false,
         status: 200,
         error: 'client_error',
       });
+    }
+  });
+
+  it('解除的其余错误码原样返回（409 / 503），响应不含原值', async () => {
+    const cases: Array<[number, string]> = [
+      [409, 'input_not_available'],
+      [409, 'approval_not_pending'],
+      [503, 'receipt_unavailable'],
+    ];
+    for (const [status, error] of cases) {
+      const fetchMock = vi.fn(async () => json(status, { error, message: error }));
+      const r = await client(fetchMock).revealApprovalInput('a-1');
+      expect(r).toEqual({ ok: false, status, error, message: error });
     }
   });
 
