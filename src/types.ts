@@ -96,7 +96,58 @@ export interface GuardApproval {
   controls?: string[];
   reason?: string;
   evidenceCorrelationId?: string;
+  /**
+   * 审批输入状态（ADR 0042 §12 D8）：PENDING 项按输入快照是否存在给出 `available` / `unavailable`；
+   * 已决项为审批时记下的值。旧 aster-api 不返回。
+   */
+  inputStatus?: GuardApprovalInputStatus;
+  /** 审批人所据视图的快照哈希；仅已决且输入可用时出现。 */
+  inputSnapshotHash?: string;
+  /** 审批时提交的哈希是否与服务端为该审批人重算的视图一致；未提交为 false。 */
+  inputSnapshotMatched?: boolean;
+  /** 审批所据视图是否为该审批人本人的解除视图。 */
+  inputRevealed?: boolean;
 }
+
+/** 审批输入视图的状态（ADR 0042 §12 D8）。 */
+export type GuardApprovalInputStatus = 'available' | 'unavailable' | 'purged' | 'integrity_failed' | 'too_large';
+
+/** 输入视图中一个 `@pii` 字段的标记。 */
+export interface GuardPiiMark {
+  path: string;
+  level: string;
+  category?: string;
+  source: string;
+}
+
+/**
+ * 审批输入视图（aster-api `GET /api/v1/guard/approvals/{id}/input`，ADR 0042 §12 D8）。
+ *
+ * `input` 中声明为 `@pii` 的字段为 `{ "$pii": { level, category } }`，未声明的子树为 `{ "$pii": { level: "unknown" } }`；
+ * 解除视图（`revealed: true`）只还原已声明的 `@pii` 字段。`status` 不是 `available` 时没有
+ * `input / piiMarks / inputSnapshotHash`，审批照常可用（不带哈希）。
+ */
+export interface GuardApprovalInput {
+  approvalId: string;
+  decisionId: string;
+  contextHash?: string;
+  status: GuardApprovalInputStatus;
+  marksSource?: 'version' | 'evaluation' | 'none';
+  inputBinding?: 'direct' | 'evaluated' | 'unbound';
+  maskRules: string;
+  revealed: boolean;
+  revealedByMe: boolean;
+  input?: Record<string, unknown>;
+  piiMarks?: GuardPiiMark[];
+  /** 该视图的快照哈希；审批时作为 `inputSnapshotHash` 回传。 */
+  inputSnapshotHash?: string;
+  inputSources?: { verified: string[]; factIssuers: string[]; factSources: string[] };
+  /** 首次决策所依赖的签名事实已失效（不参与快照哈希）。 */
+  factsStale?: boolean;
+}
+
+/** getApprovalInput / revealApprovalInput 的结果。 */
+export type GuardApprovalInputResult = { ok: true; input: GuardApprovalInput } | GuardApiError;
 
 /** 审批列表的一页；page 从 0 起，size 为服务端夹取后的实际值（1–200）。 */
 export interface GuardApprovalPage {
@@ -156,6 +207,12 @@ export interface GuardApproveOptions {
    * 结果为 `{ ok: false, status: 0, error: 'client_error' }`。
    */
   businessRole?: string;
+  /**
+   * 审批人所见输入视图的 `inputSnapshotHash`（{@link GuardClient.getApprovalInput} / `revealApprovalInput` 的返回）。
+   * 与服务端为该审批人重算的视图不符 → `{ ok: false, status: 409, error: 'input_snapshot_mismatch' }`，刷新视图后重试；
+   * 输入不可用时省略。
+   */
+  inputSnapshotHash?: string;
 }
 
 /** `reject` 的选项：comment 必填。 */
@@ -163,6 +220,8 @@ export interface GuardRejectOptions {
   comment: string;
   /** 同 {@link GuardApproveOptions.businessRole}：仅限 Latin-1 字符。 */
   businessRole?: string;
+  /** 同 {@link GuardApproveOptions.inputSnapshotHash}。 */
+  inputSnapshotHash?: string;
 }
 
 /** GuardClient 配置。baseUrl、apiKey、policyModule、policyFunction 缺失属于编程错误，构造时抛出。 */

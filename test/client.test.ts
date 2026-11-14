@@ -507,3 +507,111 @@ describe('GuardClient 审批', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe('GuardClient 审批输入（aster-api#460，ADR 0042 §12 D8）', () => {
+  const VIEW = {
+    approvalId: 'a-1',
+    contextHash: 'c'.repeat(64),
+    decisionId: 'd-1',
+    input: {
+      principal: { id: 'agent-7' },
+      context: { amount: 250000, email: { $pii: { level: 'L2', category: 'email' } } },
+    },
+    inputBinding: 'evaluated',
+    inputSnapshotHash: 'h'.repeat(64),
+    inputSources: { factIssuers: [], factSources: [], verified: [] },
+    marksSource: 'evaluation',
+    maskRules: 'v1',
+    piiMarks: [{ path: 'context.email', level: 'L2', category: 'email', source: 'ir' }],
+    revealed: false,
+    revealedByMe: false,
+    status: 'available',
+  };
+  const APPROVED: GuardDecision = {
+    ...PENDING,
+    approval: { ...PENDING.approval!, status: 'APPROVED' },
+    effectiveOutcome: 'ALLOW',
+  };
+
+  it('getApprovalInput 发 GET /approvals/{id}/input，返回 { ok:true, input }', async () => {
+    const fetchMock = vi.fn(async () => json(200, VIEW));
+    const r = await client(fetchMock).getApprovalInput('a 1');
+    const req = request(fetchMock);
+    expect(req.method).toBe('GET');
+    expect(req.url).toBe('https://guard.example/api/v1/guard/approvals/a%201/input');
+    expect(req.body).toBeUndefined();
+    expect(req.headers.get('Authorization')).toBe('Bearer ak_test');
+    expect(r).toEqual({ ok: true, input: VIEW });
+  });
+
+  it('getApprovalInput 对不可用状态同样成功（无 input / inputSnapshotHash）', async () => {
+    const unavailable = {
+      approvalId: 'a-1',
+      decisionId: 'd-1',
+      maskRules: 'v1',
+      revealed: false,
+      revealedByMe: false,
+      status: 'unavailable',
+    };
+    const fetchMock = vi.fn(async () => json(200, unavailable));
+    await expect(client(fetchMock).getApprovalInput('a-1')).resolves.toEqual({ ok: true, input: unavailable });
+  });
+
+  it('revealApprovalInput POST 空体到 /input/reveal', async () => {
+    const revealed = { ...VIEW, revealed: true, revealedByMe: true };
+    const fetchMock = vi.fn(async () => json(200, revealed));
+    const r = await client(fetchMock).revealApprovalInput('a-1');
+    const req = request(fetchMock);
+    expect(req.method).toBe('POST');
+    expect(req.url).toBe('https://guard.example/api/v1/guard/approvals/a-1/input/reveal');
+    expect(req.body).toEqual({});
+    expect(r).toEqual({ ok: true, input: revealed });
+  });
+
+  it('403 reveal_not_permitted → { ok:false, status:403, error }', async () => {
+    const fetchMock = vi.fn(async () =>
+      json(403, { error: 'reveal_not_permitted', message: '需要所需业务角色', verifiedRoles: [] }),
+    );
+    await expect(client(fetchMock).revealApprovalInput('a-1')).resolves.toEqual({
+      ok: false,
+      status: 403,
+      error: 'reveal_not_permitted',
+      message: '需要所需业务角色',
+    });
+  });
+
+  it('404 → { ok:false, status:404 }（与审批方法同一错误口径）', async () => {
+    const fetchMock = vi.fn(async () => json(404, { error: 'approval_not_found', message: '审批不存在' }));
+    await expect(client(fetchMock).getApprovalInput('a-1')).resolves.toMatchObject({
+      ok: false,
+      status: 404,
+      error: 'approval_not_found',
+    });
+  });
+
+  it('不合契约的 200（缺 status / 未知 status）→ client_error', async () => {
+    for (const body of [{ approvalId: 'a-1' }, { ...VIEW, status: 'mystery' }, [VIEW]]) {
+      const fetchMock = vi.fn(async () => json(200, body));
+      await expect(client(fetchMock).getApprovalInput('a-1')).resolves.toMatchObject({
+        ok: false,
+        status: 200,
+        error: 'client_error',
+      });
+    }
+  });
+
+  it('approve 转发 inputSnapshotHash', async () => {
+    const fetchMock = vi.fn(async () => json(200, APPROVED));
+    await client(fetchMock).approve('a-1', { comment: 'ok', inputSnapshotHash: 'h'.repeat(64) });
+    expect(request(fetchMock).body).toEqual({ comment: 'ok', inputSnapshotHash: 'h'.repeat(64) });
+  });
+
+  it('reject 转发 inputSnapshotHash；409 input_snapshot_mismatch → { ok:false }', async () => {
+    const fetchMock = vi.fn(async () =>
+      json(409, { error: 'input_snapshot_mismatch', message: '输入视图已变化，请刷新后重新审阅' }),
+    );
+    const r = await client(fetchMock).reject('a-1', { comment: 'no', inputSnapshotHash: 'h'.repeat(64) });
+    expect(request(fetchMock).body).toEqual({ comment: 'no', inputSnapshotHash: 'h'.repeat(64) });
+    expect(r).toMatchObject({ ok: false, status: 409, error: 'input_snapshot_mismatch' });
+  });
+});

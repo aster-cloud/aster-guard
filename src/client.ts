@@ -1,6 +1,8 @@
 import type {
   GuardActionInput,
   GuardApiError,
+  GuardApprovalInput,
+  GuardApprovalInputResult,
   GuardApprovalListResult,
   GuardApprovalPage,
   GuardApprovalResult,
@@ -140,16 +142,41 @@ export class GuardClient {
 
   /** 批准；成功时返回 effectiveOutcome 为 ALLOW 的决策。 */
   approve(approvalId: string, opts: GuardApproveOptions = {}): Promise<GuardApprovalResult> {
-    return this.decideApproval(approvalId, 'approve', opts.comment, opts.businessRole);
+    return this.decideApproval(approvalId, 'approve', opts.comment, opts.businessRole, opts.inputSnapshotHash);
   }
 
   /** 拒绝；comment 必填，缺失或空白时在客户端直接返回 `comment_required`，不发请求。 */
   async reject(approvalId: string, opts: GuardRejectOptions): Promise<GuardApprovalResult> {
-    const { comment, businessRole } = opts;
+    const { comment, businessRole, inputSnapshotHash } = opts;
     if (typeof comment !== 'string' || comment.trim() === '') {
       return { ok: false, status: 0, error: 'comment_required', message: '拒绝必须填写 comment' };
     }
-    return this.decideApproval(approvalId, 'reject', comment, businessRole);
+    return this.decideApproval(approvalId, 'reject', comment, businessRole, inputSnapshotHash);
+  }
+
+  /**
+   * 审批输入视图（打码，aster-api#460）：无副作用。旧 aster-api 没有该端点时为 `{ ok: false, status: 404 }`，
+   * 调用方应按「输入不可用」处理并照常审批（不带哈希）。
+   */
+  async getApprovalInput(approvalId: string): Promise<GuardApprovalInputResult> {
+    const result = interpret(
+      await this.exchange('GET', `${APPROVALS_PATH}/${encodeURIComponent(approvalId)}/input`),
+      isApprovalInput,
+    );
+    return result.ok ? { ok: true, input: result.body } : result;
+  }
+
+  /**
+   * 解除原值：只有审批 PENDING 且已验证业务角色包含所需角色者可调用；每人每审批首次解除以本人身份记入审计链。
+   * 403 `reveal_not_permitted`、409 `input_not_available` / `approval_not_pending`、503 `receipt_unavailable`
+   * 以 `{ ok: false }` 返回，响应中不含原值。
+   */
+  async revealApprovalInput(approvalId: string): Promise<GuardApprovalInputResult> {
+    const result = interpret(
+      await this.exchange('POST', `${APPROVALS_PATH}/${encodeURIComponent(approvalId)}/input/reveal`, { body: {} }),
+      isApprovalInput,
+    );
+    return result.ok ? { ok: true, input: result.body } : result;
   }
 
   private async readDecision(decisionId: string): Promise<Checked<GuardDecision>> {
@@ -161,10 +188,11 @@ export class GuardClient {
     verb: 'approve' | 'reject',
     comment: string | undefined,
     businessRole: string | undefined,
+    inputSnapshotHash: string | undefined,
   ): Promise<GuardApprovalResult> {
     const exchange = await this.exchange('POST', `${APPROVALS_PATH}/${encodeURIComponent(approvalId)}/${verb}`, {
-      // comment 为 undefined 时 JSON.stringify 不写该字段，请求体为 {}。
-      body: { comment },
+      // 值为 undefined 的字段 JSON.stringify 不写，请求体为 {}。
+      body: { comment, inputSnapshotHash },
       headers: businessRole ? { 'X-User-Business-Role': businessRole } : {},
     });
     const result = interpret(exchange, isDecision);
@@ -314,6 +342,26 @@ function isDecision(body: unknown): body is GuardDecision {
 
 function isApprovalPage(body: unknown): body is GuardApprovalPage {
   return isRecord(body) && Array.isArray(body.items) && typeof body.page === 'number' && typeof body.size === 'number';
+}
+
+const INPUT_STATUSES: ReadonlySet<unknown> = new Set([
+  'available',
+  'unavailable',
+  'purged',
+  'integrity_failed',
+  'too_large',
+]);
+
+/** 只认已知状态：未知状态的视图不能被当成可审阅的输入。 */
+function isApprovalInput(body: unknown): body is GuardApprovalInput {
+  return (
+    isRecord(body) &&
+    typeof body.approvalId === 'string' &&
+    typeof body.decisionId === 'string' &&
+    INPUT_STATUSES.has(body.status) &&
+    typeof body.revealed === 'boolean' &&
+    typeof body.revealedByMe === 'boolean'
+  );
 }
 
 function parseJson(text: string): unknown {

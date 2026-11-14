@@ -77,8 +77,25 @@ switch (decision.effectiveOutcome) {
 | `get(decisionId)` | `GET /api/v1/guard/decisions/{id}`，读取当前状态 |
 | `waitFor(decisionId, { timeoutMs = 300000, intervalMs = 2000, signal? })` | 轮询直到服务端给出非 PENDING 结论；瞬时失败（网络、超时、5xx、429）继续轮询，其他失败立即返回 DENY；到时返回 DENY `wait_timeout`；`signal` 中止后返回 DENY `wait_aborted`。三者都保留 decisionId |
 | `listApprovals(status = 'PENDING', page = 0, size = 20)` | `GET /api/v1/guard/approvals`，返回 `{ ok: true, items, page, size }` 或 `{ ok: false, … }` |
-| `approve(id, { comment?, businessRole? })` | `POST /api/v1/guard/approvals/{id}/approve`；`businessRole` 作为 `X-User-Business-Role` 头发送。HTTP 头只能携带 Latin-1 字符，非 Latin-1 的角色名（如中文）会在发出前被拒绝，得到 `{ ok: false, status: 0, error: 'client_error' }` |
-| `reject(id, { comment, businessRole? })` | `POST /api/v1/guard/approvals/{id}/reject`；`comment` 必填，缺失时客户端直接返回 `comment_required`；`businessRole` 同 `approve`（仅限 Latin-1 字符） |
+| `getApprovalInput(id)` | `GET /api/v1/guard/approvals/{id}/input`：审批输入的打码视图（无副作用），返回 `{ ok: true, input }` 或 `{ ok: false, … }`，见下文「审批输入」 |
+| `revealApprovalInput(id)` | `POST /api/v1/guard/approvals/{id}/input/reveal`：解除 `@pii` 原值（持所需业务角色者，按人记入审计链） |
+| `approve(id, { comment?, businessRole?, inputSnapshotHash? })` | `POST /api/v1/guard/approvals/{id}/approve`；`businessRole` 作为 `X-User-Business-Role` 头发送。HTTP 头只能携带 Latin-1 字符，非 Latin-1 的角色名（如中文）会在发出前被拒绝，得到 `{ ok: false, status: 0, error: 'client_error' }` |
+| `reject(id, { comment, businessRole?, inputSnapshotHash? })` | `POST /api/v1/guard/approvals/{id}/reject`；`comment` 必填，缺失时客户端直接返回 `comment_required`；`businessRole` 同 `approve`（仅限 Latin-1 字符） |
+
+### 审批输入（aster-api ADR 0042 §12）
+
+审批人可以在审批前查看决策输入的脱敏视图：
+
+- `input` 中 `@pii` 字段为 `{ "$pii": { "level": "L2", "category": "email" } }`，策略未声明的子树为 `{ "$pii": { "level": "unknown" } }`（键名也不展示，任何人都不能解除）。
+- `revealApprovalInput` 只对 `PENDING` 且持有所需业务角色的审批人开放（ESCALATE 不可解除），只还原已声明的 `@pii` 字段；每人每审批首次解除写一条 `ACTION_GUARD_INPUT_REVEAL` 审计事件。失败码：403 `reveal_not_permitted`、409 `input_not_available` / `approval_not_pending`、503 `receipt_unavailable`（此时不返回原值）。
+- 批准 / 拒绝时把所见视图的 `inputSnapshotHash` 一并提交，服务端记下 `inputSnapshotMatched` / `inputRevealed`；视图已变化返回 409 `input_snapshot_mismatch`，刷新后重试。
+- `status` 不是 `available`（`unavailable` / `purged` / `integrity_failed` / `too_large`）时没有 `input` 与哈希，照常审批、不带哈希。旧 aster-api 没有该端点（404）时同样按「不可用」处理。
+
+```ts
+const view = await guard.getApprovalInput(approvalId);
+const hash = view.ok && view.input.status === 'available' ? view.input.inputSnapshotHash : undefined;
+const r = await guard.approve(approvalId, { comment: '已核对', inputSnapshotHash: hash });
+```
 
 `effectiveOutcome` 是调用方唯一需要看的字段：`ALLOW` 才可执行；`DENY` 不执行；`PENDING` 继续轮询。
 
