@@ -124,6 +124,8 @@ function invalid(detail: ReceiptInvalidDetail): ReceiptCheck {
 function signatureValid(receipt: ExecutionReceipt, key: KeyObject): boolean {
   const signature = Buffer.from(receipt.signature, 'base64url');
   if (signature.length !== SIGNATURE_BYTES) return false;
+  // 只接受规范编码：解码会忽略末字符的填充位，不回编比对的话同一签名有多种合法写法。
+  if (signature.toString('base64url') !== receipt.signature) return false;
   let signed: Buffer;
   try {
     signed = Buffer.from(canonicalize(receipt.payload), 'utf8');

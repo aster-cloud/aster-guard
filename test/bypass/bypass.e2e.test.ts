@@ -218,9 +218,24 @@ e2e('绕过夹具套件（本地 aster-api）', { timeout: 30_000 }, () => {
   });
 });
 
+/** 翻转解码后签名的首字节：必然改变签名字节（改尾部字符可能只动到 base64url 的填充位，解码结果不变）。 */
+function flipFirstSignatureByte(signature: string): string {
+  const bytes = Buffer.from(signature, 'base64url');
+  bytes[0] = (bytes[0] ?? 0) ^ 0xff;
+  return bytes.toString('base64url');
+}
+
+/** 同一签名字节的非规范编码：末字符只承载 2 位有效数据，置位其余 4 个填充位，解码结果与原签名相同。 */
+function nonCanonicalSignature(signature: string): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const last = alphabet.indexOf(signature.slice(-1));
+  return `${signature.slice(0, -1)}${alphabet[last | 0b1111]}`;
+}
+
 describe('#5 forgedOrExpiredReceiptNeverConsumed（mock /decisions，始终启用）', () => {
   it.each([
-    ['篡改签名', (r: { signature: string }) => ({ ...r, signature: `${r.signature.slice(0, -2)}AA` })],
+    ['篡改签名', (r: { signature: string }) => ({ ...r, signature: flipFirstSignatureByte(r.signature) })],
+    ['非规范签名编码', (r: { signature: string }) => ({ ...r, signature: nonCanonicalSignature(r.signature) })],
     ['篡改 actionHash', (r: { payload: object }) => ({ ...r, payload: { ...r.payload, actionHash: '0'.repeat(64) } })],
     ['已过期', (r: { payload: object }) => ({ ...r, payload: { ...r.payload, expiresAt: '2000-01-01T00:00:00Z' } })],
   ])('%s → 不 consume、不执行', async (_name, mutate) => {
