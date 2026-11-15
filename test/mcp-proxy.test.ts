@@ -256,6 +256,22 @@ describe('aster-guard-mcp 代理：tools/call（ADR 0054 §2.2 固定顺序）',
     expect(upstreamCalls).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['换模块', (api: FakeApi) => api.rewritePayloads((p) => ({ ...p, policyModule: 'guard.lenient' }))],
+    ['换函数', (api: FakeApi) => api.rewritePayloads((p) => ({ ...p, policyFunction: 'decideLenient' }))],
+    ['缺地址键（R68 之前的 aster-api）', (api: FakeApi) => api.rewritePayloads(({ policyModule: _m, policyFunction: _f, ...rest }) => (void _m, void _f, rest))],
+  ])('R68 收据地址与 --policy 不符（%s）→ blocked receipt_invalid policy_mismatch，不 consume、不转发', async (_name, arrange) => {
+    const { agent, api, upstreamCalls } = await setup();
+    arrange(api);
+    const result = await agent.callTool({ name: 'echo', arguments: {} });
+    expect(result.isError).toBe(true);
+    const payload = result._meta?.asterGuard as Record<string, string>;
+    expect(payload).toMatchObject({ status: 'blocked', reasonCode: 'receipt_invalid' });
+    expect(payload.reason).toContain('policy_mismatch');
+    expect(api.sequence().some((s) => s.includes('consume'))).toBe(false);
+    expect(upstreamCalls).not.toHaveBeenCalled();
+  });
+
   it('denyOnToolWithOutputSchemaUsesMetaOnly：下游 SDK callTool 不抛', async () => {
     const tools: Tool[] = [
       { name: 'typed', inputSchema: { type: 'object' }, outputSchema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] } },

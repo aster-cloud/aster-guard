@@ -2,6 +2,9 @@
 
 ## 未发布
 
+- 执行收据核对签名覆盖的策略地址（aster-api ADR 0040 §13 R68，#517）：`verifyExecutionReceipt` 的期望值新增 `policy: { module, function }`，`GuardClient.run`、`verifyReceipt` 与 `aster-guard-mcp`（`--policy <module>/<function>`）取自身配置；收据 `payload.policyModule / policyFunction` 缺失或不符 → `blocked receipt_invalid`（`detail: policy_mismatch`），不 consume、不执行、不转发。R66 的 `policyVersionId` 核对保留。地址键在签名内，改写即 `bad_signature`。
+- **服务端版本耦合**：执行方要求 aster-api 已上线 R68（aster-api#539）；缺地址键的收据（R68 之前的 aster-api）一律拒绝（fail-closed）。aster-api 回滚到 R68 之前时，执行方须钉回 0.2.x。升级顺序：先 aster-api，等至少 5 分钟（收据 TTL），再升执行方。工具侧 `verifyConsumeTicket` 不变（仍核对回读的策略地址），不受此耦合影响。
+- 绕过套件新增 #8（换策略模块另取 ALLOW 收据，对应 aster-api `B8PolicySwitchBypassTest`）：mock 版始终启用，本地版需 `ASTER_GUARD_LENIENT_POLICY`。
 - `aster-guard-mcp` 监听模式（`--listen` + `--upstream-url`）：上游启动时不可达不再退出，后台以封顶指数退避（0.5 秒起、30 秒封顶、带抖动）重连；运行中断开同样重连、不重启进程。未就绪时 `/readyz` 为 `503`，`tools/call` 在裁决之前即以 `{ asterGuard: { status: "blocked", reasonCode: "upstream_unavailable" } }` 拒绝，不请求决策、不转发。stdio 子进程上游行为不变。
 
 ## 0.2.0（未发布）

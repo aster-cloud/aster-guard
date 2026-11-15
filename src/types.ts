@@ -273,6 +273,12 @@ export interface ExecutionReceiptPayload {
   issuedAt: string;
   kid: string;
   outcome: 'ALLOW';
+  /**
+   * 签名覆盖的策略地址（ADR 0040 §13 R68，aster-api#517）：`v: 1` 内的增量字段，值为空时服务端省略该键。
+   * 执行方要求二者存在且等于自身配置的 `policyModule / policyFunction`，缺失或不符按 `policy_mismatch` 拒绝。
+   */
+  policyFunction?: string;
+  policyModule?: string;
   policyVersionId?: number;
   tenantId: string;
   v: 1;

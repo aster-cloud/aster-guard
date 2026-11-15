@@ -1,6 +1,6 @@
 // 执行收据离线验签与 JWKS 缓存（ADR 0040 §12 D6）。
 // 顺序：kid 在缓存 JWKS（未命中强制刷新一次）→ Ed25519 签名对 payload 的 JCS 字节有效 → 租户 / 决策 / 结论
-// → issuedAt − 60 s ≤ now < expiresAt → actionHash → 策略版本（ADR 0054 §11 D12）。
+// → issuedAt − 60 s ≤ now < expiresAt → actionHash → 签名覆盖的策略地址（ADR 0040 §13 R68）→ 策略版本（ADR 0054 §11 D12）。
 import { createPublicKey, verify, type KeyObject } from 'node:crypto';
 import { canonicalize, JcsError } from './hash/jcs.js';
 import type { ExecutionReceipt, GuardJwk, ReceiptCheck, ReceiptInvalidDetail } from './types.js';
@@ -78,11 +78,22 @@ export class JwksCache {
   }
 }
 
-/** 核对时的期望值：配置租户、本次决策 id、本地算出的 actionHash、同一响应里的策略版本 id。 */
+/** 执行方期望收据出自的策略地址（`--policy <module>/<function>` 或 GuardClient 配置）。 */
+export interface ExpectedPolicy {
+  module: string;
+  function: string;
+}
+
+/** 核对时的期望值：配置租户、本次决策 id、本地算出的 actionHash、自身配置的策略地址、同一响应里的策略版本 id。 */
 export interface ReceiptExpectation {
   tenantId: string;
   decisionId: string;
   actionHash: string;
+  /**
+   * 执行方配置的策略地址（R68）：收据 `payload.policyModule / policyFunction` 必须存在且逐字相等。actionHash 不覆盖策略地址，
+   * 同租户换一个宽松模块会得到同一 actionHash 的 ALLOW；缺键（R68 之前的 aster-api）同样拒绝，fail-closed。
+   */
+  policy: ExpectedPolicy;
   /** 同一决策响应的 `policyVersion.id`；缺失即无法证明收据来自期望的策略（D12），按 policy_mismatch 拒绝。 */
   policyVersionId: number | undefined;
 }
@@ -113,6 +124,7 @@ export async function verifyExecutionReceipt(
   const expiresAt = Date.parse(p.expiresAt);
   if (!(issuedAt - ISSUED_AT_SKEW_MS <= t && t < expiresAt)) return invalid('outside_window');
   if (p.actionHash !== expect.actionHash) return invalid('action_hash_mismatch');
+  if (p.policyModule !== expect.policy.module || p.policyFunction !== expect.policy.function) return invalid('policy_mismatch');
   if (p.policyVersionId === undefined || p.policyVersionId !== expect.policyVersionId) return invalid('policy_mismatch');
   return { ok: true };
 }
@@ -155,6 +167,8 @@ function isReceiptShape(value: unknown): value is ExecutionReceipt {
     typeof p.expiresAt === 'string' &&
     !Number.isNaN(Date.parse(p.issuedAt)) &&
     !Number.isNaN(Date.parse(p.expiresAt)) &&
+    (p.policyModule === undefined || typeof p.policyModule === 'string') &&
+    (p.policyFunction === undefined || typeof p.policyFunction === 'string') &&
     (p.policyVersionId === undefined || typeof p.policyVersionId === 'number')
   );
 }

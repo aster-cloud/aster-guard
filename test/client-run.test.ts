@@ -111,6 +111,64 @@ describe('GuardClient.run', () => {
     expect(outcome).toMatchObject({ kind: 'blocked', decision: { reasonCode: 'receipt_invalid', reason: expect.stringContaining('policy_mismatch') } });
   });
 
+  describe('R68 签名覆盖的策略地址（#517，ADR 0040 §13）', () => {
+    it('收据地址等于配置的 policyModule / policyFunction → 执行', async () => {
+      const { api, client } = setup();
+      const execute = vi.fn(async () => 'ok');
+      const outcome = await client.run(INPUT, execute, EXEC);
+      expect(outcome.kind).toBe('executed');
+      expect(execute).toHaveBeenCalledTimes(1);
+      const receipt = (await api.decisions.values().next().value!).response.executionReceipt!;
+      expect(receipt.payload).toMatchObject({ policyModule: 'guard.test', policyFunction: 'decide' });
+    });
+
+    it.each([
+      ['换模块', { policyModule: 'guard.lenient' }],
+      ['换函数', { policyFunction: 'decideLenient' }],
+    ])('签名有效但%s → blocked receipt_invalid / policy_mismatch，不 consume、不执行', async (_name, change) => {
+      const { api, client } = setup();
+      api.rewritePayloads((p) => ({ ...p, ...change }));
+      const execute = vi.fn();
+      const outcome = await client.run(INPUT, execute, EXEC);
+      expect(outcome).toMatchObject({ kind: 'blocked', decision: { reasonCode: 'receipt_invalid', reason: expect.stringContaining('policy_mismatch') } });
+      expect(api.sequence().some((s) => s.includes('consume'))).toBe(false);
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('收据没有地址键（R68 之前的 aster-api）→ policy_mismatch，fail-closed', async () => {
+      const { api, client } = setup();
+      api.rewritePayloads(({ policyModule: _m, policyFunction: _f, ...rest }) => (void _m, void _f, rest));
+      const execute = vi.fn();
+      const outcome = await client.run(INPUT, execute, EXEC);
+      expect(outcome).toMatchObject({ kind: 'blocked', decision: { reasonCode: 'receipt_invalid', reason: expect.stringContaining('policy_mismatch') } });
+      expect(api.sequence().some((s) => s.includes('consume'))).toBe(false);
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('签名后把地址改写成期望值 → bad_signature，不 consume', async () => {
+      const { api, client } = setup();
+      api.rewritePayloads((p) => ({ ...p, policyModule: 'guard.lenient' }));
+      api.mutateReceipts((r) => ({ ...r, payload: { ...r.payload, policyModule: 'guard.test' } }));
+      const execute = vi.fn();
+      const outcome = await client.run(INPUT, execute, EXEC);
+      expect(outcome).toMatchObject({ kind: 'blocked', decision: { reasonCode: 'receipt_invalid', reason: expect.stringContaining('bad_signature') } });
+      expect(api.sequence().some((s) => s.includes('consume'))).toBe(false);
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('verifyReceipt（低层）同样核对配置地址', async () => {
+      const { api, client } = setup();
+      api.rewritePayloads((p) => ({ ...p, policyModule: 'guard.lenient' }));
+      const decision = await client.check(INPUT);
+      const check = await client.verifyReceipt(decision.executionReceipt, {
+        decisionId: decision.decisionId,
+        actionHash: hashAction({ ...INPUT, principal: { id: 'agent-42', type: 'agent' } }),
+        policyVersionId: decision.policyVersion?.id,
+      });
+      expect(check).toEqual({ ok: false, reasonCode: 'receipt_invalid', detail: 'policy_mismatch' });
+    });
+  });
+
   it.each(['not_allowed', 'receipt_consumed', 'receipt_expired', 'action_mismatch'])('consume 409 %s → blocked 同码，回调未调用', async (code) => {
     const { api, client } = setup();
     api.override((req) => (req.path.endsWith('/consume') ? new Response(JSON.stringify({ error: code }), { status: 409 }) : undefined));
