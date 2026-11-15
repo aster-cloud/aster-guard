@@ -311,7 +311,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 ```
 
-工具侧不对回读的 `executionReceipt` 做离线验签：工具对回读响应的整体信任来自「用自己的 key 在线向 aster-api 查询」，`actionHash`、`consumedBy`、`result` 同样只来自这次回读、都不在签名内；单独对地址验签既不增加独立的证明，又要在工具侧引入 JWKS 拉取、而收据时间窗（5 分钟）可能在 consume 之后、工具核对之前到期。签名覆盖的地址由执行方（SDK `run` / 代理）在 consume **之前**核对；工具侧仍核对回读的 `policyModule / policyFunction`（R66 D12），二者合起来覆盖 #517。
+工具侧不对回读的 `executionReceipt` 做离线验签。工具的信任边界是「用自己的 key 经鉴权向 aster-api 回读决策」：放行所依据的 `actionHash`、`consumedBy`、`result` 都只来自这次回读、本就不在签名内，所以对地址验签虽能把地址绑定到收据，却不改变工具放行的信任根——能伪造回读响应的一方同样能伪造 consume 状态；它还要在工具侧引入 JWKS 拉取，且收据时间窗（5 分钟）可能在 consume 之后、工具核对之前到期。签名覆盖的地址由执行方（SDK `run` / 代理）在 consume **之前**核对；工具侧核对回读的 `policyModule / policyFunction`（R66 D12），二者合起来覆盖 #517。
 
 核对顺序：票据形状 → 用工具自己的 key 回读决策（不可达 / 非 200 → `guard_unavailable`）→ `ALLOW` → 回读的 `policyModule / policyFunction` 等于期望策略（`policy_mismatch`）→ 票据 `envelope` 的动作名与资源等于工具自己的映射、按工具自己的映射对**实际收到的参数**重算哈希（`action_mismatch`）→ `consumedBy.attemptId`（`attempt_mismatch`）→ 时间窗（`ticket_expired`）→ 未写结果（`result_recorded`）→ 原子认领 attemptId（`ticket_replayed`）。这是 **at-most-once 放行**：认领后工具崩溃则动作不执行，须重新申请决策。`MemoryAttemptLedger` 重启后 ttl 窗口内同一票据可再被放行一次——多副本或会重启的工具必须提供共享持久存储实现。
 
@@ -453,7 +453,7 @@ pnpm run build       # tsc → dist/
 自本版本（R68 地址核对）起，执行方（`GuardClient.run`、`verifyReceipt`、`aster-guard-mcp`）**要求 aster-api 已上线 ADR 0040 §13 R68**（执行收据签名载荷含 `policyModule / policyFunction`，aster-api#539）。缺这两键的收据——R68 之前的 aster-api 签发的，或 R68 上线前已签发、尚在 5 分钟 TTL 内的——一律 `blocked receipt_invalid`（`policy_mismatch`），不 consume、不执行：fail-closed，不会误放行，但全部受守卫动作停摆。
 
 - **升级顺序**：先部署含 R68 的 aster-api，**至少等一个收据 TTL（5 分钟）** 让无地址键的旧收据过期，再升级执行方。0.2.x 执行方在 R68 服务端上照常工作（新增键在签名字节内，0.2.x 不读它们）。
-- **回滚耦合**：aster-api 回滚到 R68 之前（或自托管的 aster-api 没有 R68）时，执行方必须同时钉回 `@aster-cloud/aster-guard@0.2.x`（代理镜像同理），否则全部 `policy_mismatch`。
+- **回滚耦合**：aster-api 回滚到 R68 之前（或自托管的 aster-api 没有 R68）时，执行方必须同时钉回 npm 上已发布的 `@aster-cloud/aster-guard@0.2.0`（不含本项核对）；`aster-guard-mcp` 代理镜像钉回本项合入 main 之前构建的镜像 digest。否则全部 `policy_mismatch`。
 - 工具侧 `verifyConsumeTicket` 不读收据地址键，不受此耦合影响。
 
 ## 0.2.0 行为变化
