@@ -49,3 +49,6 @@ jobs:
 
       - name: Build
         run: pnpm run build
+
+      - name: Pin closure guard self-test
+        run: bash scripts/ci/pin-closure-guard.test.sh
