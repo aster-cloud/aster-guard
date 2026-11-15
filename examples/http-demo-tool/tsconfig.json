@@ -1,0 +1,18 @@
+{
+  // 类型检查用：@aster-cloud/aster-guard 映射到根包源码，无需先构建根包（CI 的 typecheck 在 build 之前）。
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "ES2024.String"],
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "paths": {
+      "@aster-cloud/aster-guard": ["../../src/index.ts"],
+      "@aster-cloud/aster-guard/tool": ["../../src/tool/index.ts"]
+    }
+  },
+  "include": ["src/**/*", "test/**/*"]
+}

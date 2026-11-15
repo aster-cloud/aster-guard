@@ -128,7 +128,7 @@ const r = await guard.approve(approvalId, { comment: '已核对', inputSnapshotH
 
 ## aster-guard-mcp
 
-stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 MCP 服务器：原样转发 `tools/list`，并拦截每一次 `tools/call`：
+stdio MCP 服务器（ADR 0040 §6；`--listen` 时为 Streamable HTTP，见下节）。指定 `--upstream` 或 `--upstream-url` 时包裹该上游 MCP 服务器：原样转发 `tools/list`，并拦截每一次 `tools/call`：
 
 1. 工具须在白名单内（`--tools` / 配置文件 `tools`；未配置则全部暴露并在启动时告警）；参数先**规范化**：递归按键排序、`null` 原样保留、不删键不改类型。规范化后的对象既是 `action.context` 也是转发给上游的 `arguments`（同一对象）；按工具映射 `digestArgs` 列出的键在 `context` 中以 `{ "$sha256": … }` 代入（转发原值）。
 2. `GuardClient.run` 按固定顺序执行：决策（新 UUID 幂等键；PENDING 等到 `--approval-timeout`）→ 收据验签 → consume → 转发 → 回写（`executed` / `failed`，`resultHash` 为 `content` 的 jcs-sha256/v1）。
@@ -167,7 +167,9 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 | `--base-url <url>` | 必填，aster-api 根地址 |
 | `--policy <module>/<function>` | 必填，裁决所用的策略，如 `guard.customer/decide` |
 | `--principal-id <id>` | 必填，发起主体 id |
-| `--upstream "<cmd> [args…]"` | 上游 MCP 服务器的启动命令，按 shell 规则切分（支持引号）；省略则为治理工具模式 |
+| `--upstream "<cmd> [args…]"` | 上游 MCP 服务器的启动命令，按 shell 规则切分（支持引号）；与 `--upstream-url` 都省略则为治理工具模式 |
+| `--upstream-url <url>` | 上游为 Streamable HTTP MCP 服务器（`http(s)`，如 `http://demo-tool:8080/mcp`）；与 `--upstream` 二选一 |
+| `--upstream-auth-env <name>` | 只配 `--upstream-url`：以该环境变量的值作 `Authorization: Bearer` 发给上游；不能与 API key 变量同名，未设置或为空即参数错误；值不写进日志与错误信息 |
 | `--api-key-env <name>` | 存放 API key 的环境变量名，默认 `ASTER_GUARD_API_KEY`；API key 只从环境变量读取 |
 | `--principal-type <type>` | 默认 `agent` |
 | `--principal-roles <a,b>` | 逗号分隔，至多 16 项 |
@@ -176,7 +178,7 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 | `--resource-from <argName>` | 以该工具参数的值作为 `resource.id`；过长或含控制字符时改用 `sha256:<hex>` |
 | `--agent-model <model>` | 写入 `action.agent.model` |
 | `--tenant-id <id>` | 代理模式必填：API key 所属租户，收据 `payload.tenantId` 须与之相等 |
-| `--isolation network\|auth` | 代理模式必填（配置自述，由部署层绕过测试验证）：`network` = 上游只接受代理的连接（stdio 子进程天然满足）；`auth` = 转发时在 `params._meta["io.aster/guard-consume"]` 附 consume 票据，工具侧用 `@aster-cloud/aster-guard/tool` 核对 |
+| `--isolation <list>` | 代理模式必填，逗号分隔、去重（配置自述，由部署层绕过测试验证；ADR 0054 §12 D1）：`network` = 上游只接受代理的连接（stdio 子进程天然满足；HTTP 上游由部署层网络策略保证，代理本身不做任何事）；`auth` = 转发时在 `params._meta["io.aster/guard-consume"]` 附 consume 票据，工具侧用 `@aster-cloud/aster-guard/tool` 核对；`network,auth` = 两层同时声明，任一层单独失效时另一层仍挡住直连。0.2.0 的单值写法照常可用 |
 | `--tools <a,b>` | 工具白名单（覆盖配置文件 `tools`） |
 | `--config <file.json>` | `{ "tools": [...], "actions": { "<tool>": { "resourceFrom", "digestArgs", "actionName" } } }`，未知键报错，`actions` 中的工具须在白名单内 |
 | `--executor-id <id>` | 对账用执行方标识，默认 `aster-guard-mcp@<hostname>` |
@@ -186,6 +188,29 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 上游子进程继承代理的环境变量，但不包含 API key 所在的那个变量。stdout 是 MCP 通道，日志一律写 stderr。退出码：`0` 正常结束（含 `--help`），`1` 上游无法启动、意外断开或对下游的 stdio 通道建立失败（此时先关闭上游子进程），`2` 参数错误。
 
 要在宿主侧程序里嵌入代理（自行提供 transport 与已连接的上游 `Client`），可从子路径导入：`import { createGuardProxyServer } from '@aster-cloud/aster-guard/mcp'`，选项与 CLI 参数一一对应（`approvalTimeoutMs`、`upstreamTimeoutMs`、`resourceFromArg`、`agentModel`）。
+
+### Streamable HTTP 模式（ADR 0054 §3.1、§12 D4）
+
+`--listen <host>:<port>` 让代理以**无状态** Streamable HTTP 提供服务，适合把代理部署成独立服务、模型与原始工具分处不同网络位置（如 k3s 的 `aster-agents → aster-guard → aster-tools`）：
+
+```bash
+ASTER_GUARD_API_KEY=… aster-guard-mcp --listen 0.0.0.0:8080 \
+  --upstream-url http://demo-tool.aster-tools.svc.cluster.local:8080/mcp --isolation network,auth \
+  --base-url http://aster-api.aster-cloud.svc.cluster.local --policy guard.demo/decide --tenant-id <团队> \
+  --tools demo_echo,demo_delete --agents-file /etc/aster-guard/agents.json
+```
+
+| 路径 | 行为 |
+|---|---|
+| `POST /mcp` | `Authorization: Bearer <token>` 必须匹配登记项，否则 `401 {"error":"unauthorized"}` + `WWW-Authenticate: Bearer`（不建 MCP 服务器、不访问 Guard）；请求体超过 1 MiB → `413`；非 JSON → `400`。通过后为这一个请求新建代理 MCP 服务器与 transport（`enableJsonResponse`），响应结束即关闭 |
+| `GET` / `DELETE /mcp` | `405`（无状态：没有会话与服务端推送流） |
+| `GET /healthz` | `200 ok`（进程存活，用作 liveness） |
+| `GET /readyz` | 最近 30 秒内上游 `tools/list`（3 秒超时）成功过即 `200`，否则 `503`；结论缓存 10 秒，并发请求共享一次探测（用作 readiness） |
+
+- **Agent 登记**（`--agents-file`）：`{ "agents": [{ "id": "…", "tokenSha256": "<64 位小写十六进制>", "principalId"?: "…", "principalRoles"?: ["…"] }] }`。只存 token 的 sha256，`id` 与 `tokenSha256` 各自唯一，未知键报错。鉴权对每一项做定长比较、不提前返回。每个 Agent 以自己的主体 `{ id: principalId ?? id, type: "agent", roles? }` 裁决，所以监听模式不接受 `--principal-id / --principal-type / --principal-roles`。
+- 上游连接与工具名缓存跨请求共享：连续的 `tools/call` 不会每次都向上游刷新 `tools/list`。
+- `SIGTERM` / `SIGINT`：停止接受新连接，等在途请求结束（至多 5 秒）后关闭上游，以 `0` 退出。
+- 嵌入：`import { startHttpProxy, loadAgents } from '@aster-cloud/aster-guard/mcp'`。
 
 ### 客户端配置
 

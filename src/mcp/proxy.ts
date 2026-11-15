@@ -49,6 +49,9 @@ export type GuardClientLike = Pick<
 /** 代理用到的上游 Client 方法；代理接管其生命周期，close() 时一并关闭。 */
 export type UpstreamClient = Pick<Client, 'listTools' | 'callTool' | 'close'>;
 
+/** 原始工具端点的隔离方式（ADR 0054 §3.1–§3.3、§12 D1）。 */
+export type Isolation = 'network' | 'auth';
+
 export interface GuardProxyOptions {
   client: GuardClientLike;
   /** 被包裹的上游 MCP 服务器（已连接）；缺省为治理工具模式。 */
@@ -68,12 +71,17 @@ export interface GuardProxyOptions {
   agentModel?: string;
   /** 对账用执行方标识；缺省由 GuardClient.run 取 `aster-guard-sdk@<hostname>`，CLI 传 `aster-guard-mcp@<hostname>`。 */
   executorId?: string;
-  /** 隔离方式；`auth` 时转发请求附 consume 票据。 */
-  isolation?: 'network' | 'auth';
+  /** 隔离方式（单值或列表）；含 `auth` 时转发请求附 consume 票据。 */
+  isolation?: Isolation | readonly Isolation[];
   /** 工具白名单；缺省全部上游工具。 */
   tools?: string[];
   /** 按工具的 action 映射。 */
   actions?: Record<string, ActionMapping>;
+  /**
+   * 上游工具名缓存；缺省每个代理实例自建。监听模式每个请求新建一个代理实例，共享同一缓存，
+   * 避免每次 tools/call 都向上游刷新 tools/list。
+   */
+  toolNames?: ToolNameCache;
   /** 仅测试：consume 之前调用，入参为将被转发的参数对象（绕过套件 #3）。CLI 不暴露。 */
   __beforeConsume?: (args: Record<string, unknown>) => void;
 }
@@ -128,7 +136,7 @@ function installGovernanceTools(server: Server, options: GuardProxyOptions): voi
 function installGuardedUpstream(server: Server, upstream: UpstreamClient, options: ResolvedOptions): void {
   const timeout = options.upstreamTimeoutMs;
   const allow = options.tools === undefined ? undefined : new Set(options.tools);
-  const knownTools = new UpstreamToolNames(upstream, timeout);
+  const knownTools = options.toolNames ?? createToolNameCache(upstream, timeout);
   const exposed = (tool: Tool) => allow === undefined || allow.has(tool.name);
 
   server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
@@ -165,7 +173,7 @@ function installGuardedUpstream(server: Server, upstream: UpstreamClient, option
         {
           name,
           arguments: args,
-          ...(options.isolation === 'auth'
+          ...(isolations(options).includes('auth')
             ? { _meta: { [CONSUME_TICKET_META_KEY]: { decisionId: grant.decisionId, attemptId: grant.attemptId, envelope: envelopeOf(action) } } }
             : {}),
         },
@@ -207,6 +215,13 @@ function installGuardedUpstream(server: Server, upstream: UpstreamClient, option
   });
 }
 
+/** 把单值或列表形式的 isolation 统一为列表。 */
+function isolations(options: GuardProxyOptions): readonly Isolation[] {
+  const { isolation } = options;
+  if (isolation === undefined) return [];
+  return typeof isolation === 'string' ? [isolation] : isolation;
+}
+
 /** 上游结果归类：isError → failed；resultHash 为 content 的 jcs-sha256/v1（无法规范化时省略）。 */
 function classifyUpstream(result: CallToolResult): { status: 'executed' | 'failed'; errorCode?: string; resultHash?: string } {
   let resultHash: string | undefined;
@@ -241,17 +256,28 @@ function relayProgress(
   };
 }
 
+/** 上游工具名缓存：记下 tools/list 的结果，按名取工具定义（未知为 undefined）。 */
+export interface ToolNameCache {
+  remember(tools: Tool[]): void;
+  get(name: string): Promise<Tool | undefined>;
+}
+
+/** 新建上游工具名缓存；timeoutMs 为刷新 tools/list 的请求超时。 */
+export function createToolNameCache(upstream: Pick<UpstreamClient, 'listTools'>, timeoutMs: number): ToolNameCache {
+  return new UpstreamToolNames(upstream, timeoutMs);
+}
+
 /**
  * 上游工具名缓存，用于拒绝未知工具。tools/list 转发时与完整刷新时都会记下工具名；命中缓存不访问上游。
  * 未命中时（客户端可能不先 tools/list 就调用，上游工具集也可能已变化）每次调用至多做一次完整刷新，
  * 并发的未命中共享同一次刷新。
  */
-class UpstreamToolNames {
+class UpstreamToolNames implements ToolNameCache {
   private readonly names = new Map<string, Tool>();
   private refreshing: Promise<void> | undefined;
 
   constructor(
-    private readonly upstream: UpstreamClient,
+    private readonly upstream: Pick<UpstreamClient, 'listTools'>,
     private readonly timeout: number,
   ) {}
 

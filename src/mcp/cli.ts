@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 // aster-guard-mcp 可执行入口（ADR 0040 §6）。stdout 是 MCP 通道，所有日志一律写 stderr。
 // 退出码：0 正常结束（含 --help）；1 上游无法连接或意外断开；2 参数错误。
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { GuardClient } from '../client.js';
 import { VERSION } from '../index.js';
-import { ConfigError, parseCliArgs, upstreamEnv, USAGE, wantsHelp, type ProxyConfig } from './config.js';
-import { createGuardProxyServer, type GuardProxy } from './proxy.js';
+import type { GuardPrincipal } from '../types.js';
+import { loadAgents, type AgentEntry } from './agents.js';
+import { ConfigError, parseCliArgs, USAGE, wantsHelp, type ProxyConfig } from './config.js';
+import { agentPrincipal, startHttpProxy } from './http-server.js';
+import { createGuardProxyServer, type GuardProxy, type GuardProxyOptions } from './proxy.js';
+import { connectUpstream, describeUpstream } from './upstream.js';
 
 const NAME = 'aster-guard-mcp';
 
@@ -31,8 +34,10 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
   let config: ProxyConfig;
+  let agents: AgentEntry[] | undefined;
   try {
     config = parseCliArgs(argv, process.env);
+    agents = config.agentsFile === undefined ? undefined : loadAgents(config.agentsFile);
   } catch (e) {
     if (!(e instanceof ConfigError)) throw e;
     process.stderr.write(`${NAME}: ${e.message}\n\n${USAGE}`);
@@ -42,25 +47,84 @@ async function main(argv: string[]): Promise<void> {
   let upstream: Client | undefined;
   if (config.upstream) {
     try {
-      upstream = await connectUpstream(config.upstream, config.apiKeyEnv);
+      upstream = await connectUpstream(config.upstream, process.env, config.apiKeyEnv);
     } catch (e) {
-      log(`无法连接上游 MCP 服务器（${config.upstream.command}）：${errorMessage(e)}`);
+      log(`无法连接上游 MCP 服务器（${describeUpstream(config.upstream)}）：${errorMessage(e)}`);
       process.exitCode = 1;
       return;
     }
   }
-  await serve(config, upstream);
+  if (config.listen && agents && upstream) {
+    await serveHttp(config, config.listen, agents, upstream);
+  } else {
+    await serve(config, upstream);
+  }
 }
 
-/** 启动上游子进程并完成 MCP 初始化；失败时 SDK 会关闭 transport（结束子进程）后抛出。 */
-async function connectUpstream(
-  { command, args }: NonNullable<ProxyConfig['upstream']>,
-  apiKeyEnv: string,
-): Promise<Client> {
-  const client = new Client({ name: NAME, version: VERSION });
-  // 上游的 stderr 继承本进程 stderr；stdout 由 transport 接管为 MCP 通道。
-  await client.connect(new StdioClientTransport({ command, args, env: upstreamEnv(process.env, apiKeyEnv) }));
-  return client;
+/** 两种服务方式共用的代理选项；principal 由调用方给出（stdio 取配置，监听模式取 Agent 登记）。 */
+function proxyOptions(config: ProxyConfig, principal: GuardPrincipal): Omit<GuardProxyOptions, 'upstream'> {
+  const { baseUrl, apiKey, policyModule, policyFunction, tenantId } = config;
+  return {
+    client: new GuardClient({ baseUrl, apiKey, policyModule, policyFunction, principal, tenantId }),
+    executorId: config.executorId,
+    isolation: config.isolation,
+    tools: config.tools,
+    actions: config.actions,
+    principal,
+    approvalTimeoutMs: config.approvalTimeoutMs,
+    upstreamTimeoutMs: config.upstreamTimeoutMs,
+    resourceFromArg: config.resourceFromArg,
+    agentModel: config.agentModel,
+  };
+}
+
+function warnIfNoAllowList(config: ProxyConfig): void {
+  if (config.upstream && config.tools === undefined) {
+    log('警告：未配置工具白名单（--tools 或配置文件 tools），全部上游工具都会暴露给模型');
+  }
+}
+
+/**
+ * 监听模式：无状态 Streamable HTTP（ADR 0054 §12 D4）。每个 Agent 的 GuardClient 在启动时构造一次。
+ * SIGTERM / SIGINT：停止接受新连接，等在途请求结束（至多 SHUTDOWN_GRACE_MS）后关闭上游并以 0 退出。
+ */
+async function serveHttp(
+  config: ProxyConfig,
+  listen: NonNullable<ProxyConfig['listen']>,
+  agents: readonly AgentEntry[],
+  upstream: Client,
+): Promise<void> {
+  warnIfNoAllowList(config);
+  let http;
+  try {
+    http = await startHttpProxy({
+      listen,
+      agents,
+      upstream,
+      makeProxyOptions: (agent) => proxyOptions(config, agentPrincipal(agent)),
+    });
+  } catch (e) {
+    await upstream.close().catch(() => undefined);
+    throw e;
+  }
+  let closing = false;
+  const shutdown = (code: number): void => {
+    if (closing) return;
+    closing = true;
+    process.exitCode = code;
+    setTimeout(() => process.exit(code), SHUTDOWN_GRACE_MS).unref();
+    http
+      .close()
+      .then(() => upstream.close())
+      .catch((e: unknown) => log(`关闭时出错：${errorMessage(e)}`));
+  };
+  upstream.onerror = (e) => log(`上游 MCP 错误：${e.message}`);
+  process.once('SIGINT', () => shutdown(0));
+  process.once('SIGTERM', () => shutdown(0));
+  log(
+    `${VERSION} 监听模式已启动：${http.url.origin}/mcp，上游：${config.upstream ? describeUpstream(config.upstream) : ''}，` +
+      `已登记 ${agents.length} 个 Agent`,
+  );
 }
 
 /**
@@ -68,25 +132,10 @@ async function connectUpstream(
  * 由入口以 1 退出——否则上游子进程要等到本进程退出、管道关闭后才结束。连接成功后才接好生命周期。
  */
 async function serve(config: ProxyConfig, upstream: Client | undefined): Promise<void> {
-  const { baseUrl, apiKey, policyModule, policyFunction, principal } = config;
-  const { approvalTimeoutMs, upstreamTimeoutMs, resourceFromArg, agentModel } = config;
-  const { tenantId, executorId, isolation, tools, actions } = config;
-  if (upstream && tools === undefined) {
-    log('警告：未配置工具白名单（--tools 或配置文件 tools），全部上游工具都会暴露给模型');
-  }
-  const proxy = createGuardProxyServer({
-    client: new GuardClient({ baseUrl, apiKey, policyModule, policyFunction, principal, tenantId }),
-    executorId,
-    isolation,
-    tools,
-    actions,
-    upstream,
-    principal,
-    approvalTimeoutMs,
-    upstreamTimeoutMs,
-    resourceFromArg,
-    agentModel,
-  });
+  // 非监听模式下 parseCliArgs 保证 principal 存在。
+  const principal = config.principal as GuardPrincipal;
+  warnIfNoAllowList(config);
+  const proxy = createGuardProxyServer({ ...proxyOptions(config, principal), upstream });
 
   try {
     await proxy.server.connect(new StdioServerTransport());
@@ -96,9 +145,9 @@ async function serve(config: ProxyConfig, upstream: Client | undefined): Promise
   }
   watchLifecycle(proxy, upstream);
   log(
-    upstream
-      ? `${VERSION} 代理模式已启动，上游：${config.upstream?.command}`
-      : `${VERSION} 治理工具模式已启动（未指定 --upstream）`,
+    config.upstream
+      ? `${VERSION} 代理模式已启动，上游：${describeUpstream(config.upstream)}`
+      : `${VERSION} 治理工具模式已启动（未指定上游）`,
   );
 }
 

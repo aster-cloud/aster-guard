@@ -54,7 +54,7 @@ describe('parseCliArgs', () => {
     );
 
     expect(config).toEqual({
-      upstream: { command: 'node', args: ['server.js', '--flag', 'a b'] },
+      upstream: { kind: 'stdio', command: 'node', args: ['server.js', '--flag', 'a b'] },
       baseUrl: 'https://api.example.com/',
       apiKeyEnv: 'MY_GUARD_KEY',
       apiKey: 'ak_custom',
@@ -66,7 +66,7 @@ describe('parseCliArgs', () => {
       resourceFromArg: 'customerId',
       agentModel: 'claude-x',
       tenantId: 'team-1',
-      isolation: 'network',
+      isolation: ['network'],
       executorId: 'aster-guard-mcp@host-1',
       tools: ['echo', 'delete_customer'],
       actions: {},
@@ -208,7 +208,7 @@ describe('--upstream 按 shell 规则切分', () => {
     ["cmd '' \"\"", ['cmd', '', '']],
     ["cmd '\\n'", ['cmd', '\\n']],
   ])('%j', (input, [command, ...args]) => {
-    expect(parseCliArgs([...REQUIRED, ...EXEC, '--upstream', input], ENV).upstream).toEqual({ command, args });
+    expect(parseCliArgs([...REQUIRED, ...EXEC, '--upstream', input], ENV).upstream).toEqual({ kind: 'stdio', command, args });
   });
 
   it.each([
@@ -235,7 +235,7 @@ describe('执行点配置（ADR 0054 §3.1–3.3）', () => {
     expect(() => parseCliArgs(PROXY, ENV)).toThrow(/--tenant-id/);
     expect(() => parseCliArgs([...PROXY, '--tenant-id', 't'], ENV)).toThrow(/--isolation/);
     expect(() => parseCliArgs([...PROXY, '--tenant-id', 't', '--isolation', 'vpn'], ENV)).toThrow(/network 或 auth/);
-    expect(parseCliArgs([...PROXY, ...EXEC], ENV)).toMatchObject({ tenantId: 'team-1', isolation: 'network' });
+    expect(parseCliArgs([...PROXY, ...EXEC], ENV)).toMatchObject({ tenantId: 'team-1', isolation: ['network'] });
   });
 
   it('执行点参数只用于代理模式', () => {
@@ -273,5 +273,92 @@ describe('执行点配置（ADR 0054 §3.1–3.3）', () => {
   it('mappingForToolOutsideAllowListRejected', () => {
     const path = configFile({ tools: ['a'], actions: { b: { actionName: 'b' } } });
     expect(() => parseCliArgs([...PROXY, ...EXEC, '--config', path], ENV)).toThrow(/不在白名单内/);
+  });
+});
+
+describe('HTTP 上游与 --isolation 列表（ADR 0054 §12 D1/D4）', () => {
+  const HTTP = [...REQUIRED, '--tenant-id', 'team-1', '--upstream-url', 'http://tool.local:8080/mcp'];
+
+  it('isolationListIsParsedSortedAndDeduped', () => {
+    expect(parseCliArgs([...HTTP, '--isolation', 'network,auth,auth'], ENV).isolation).toEqual(['auth', 'network']);
+  });
+
+  it('singleIsolationStillAccepted', () => {
+    expect(parseCliArgs([...HTTP, '--isolation', 'auth'], ENV).isolation).toEqual(['auth']);
+    expect(() => parseCliArgs([...HTTP, '--isolation', 'network,vpn'], ENV)).toThrow(/network 或 auth/);
+    expect(() => parseCliArgs([...HTTP, '--isolation', ' , '], ENV)).toThrow(ConfigError);
+  });
+
+  it('upstreamUrlIsParsedAsHttpSpec', () => {
+    const config = parseCliArgs([...HTTP, '--isolation', 'network', '--upstream-auth-env', 'TOOL_TOKEN'], { ...ENV, TOOL_TOKEN: 't' });
+    expect(config.upstream).toEqual({ kind: 'http', url: new URL('http://tool.local:8080/mcp'), authEnv: 'TOOL_TOKEN' });
+    expect(() => parseCliArgs([...REQUIRED, '--tenant-id', 't', '--isolation', 'network', '--upstream-url', 'ftp://x/mcp'], ENV)).toThrow(
+      /http\(s\)/,
+    );
+  });
+
+  it('upstreamAndUpstreamUrlAreExclusive', () => {
+    expect(() => parseCliArgs([...HTTP, '--isolation', 'network', '--upstream', 'node s.js'], ENV)).toThrow(/不能同时/);
+  });
+
+  it('upstreamAuthEnvRequiresUrl', () => {
+    expect(() =>
+      parseCliArgs([...REQUIRED, ...EXEC, '--upstream', 'node s.js', '--upstream-auth-env', 'TOOL_TOKEN'], { ...ENV, TOOL_TOKEN: 't' }),
+    ).toThrow(/--upstream-auth-env 只用于 --upstream-url/);
+  });
+
+  it('upstreamAuthEnvMustDifferFromApiKeyEnv', () => {
+    expect(() => parseCliArgs([...HTTP, '--isolation', 'network', '--upstream-auth-env', 'ASTER_GUARD_API_KEY'], ENV)).toThrow(
+      /不能与 API key/,
+    );
+  });
+
+  it('missingUpstreamAuthValueIsConfigError', () => {
+    const run = (env: NodeJS.ProcessEnv) => () => parseCliArgs([...HTTP, '--isolation', 'network', '--upstream-auth-env', 'TOOL_TOKEN'], env);
+    expect(run(ENV)).toThrow(/TOOL_TOKEN/);
+    expect(run({ ...ENV, TOOL_TOKEN: '  ' })).toThrow(ConfigError);
+    const message = (env: NodeJS.ProcessEnv, isolation: string) => {
+      try {
+        parseCliArgs([...HTTP, '--isolation', isolation, '--upstream-auth-env', 'TOOL_TOKEN', '--upstream', 'x'], env);
+      } catch (e) {
+        return String(e);
+      }
+      return '(未抛出)';
+    };
+    for (const isolation of ['vpn', 'network']) {
+      const text = message({ ...ENV, TOOL_TOKEN: 'v4lue-secret' }, isolation);
+      expect(text).toMatch(/ConfigError/);
+      expect(text).not.toContain('v4lue-secret');
+    }
+  });
+});
+
+describe('监听模式 --listen / --agents-file（ADR 0054 §12 D4）', () => {
+  const BASE = ['--base-url', 'https://api.example.com', '--policy', 'guard.demo/decide', '--tenant-id', 't'];
+  const HTTP = ['--upstream-url', 'http://tool:8080/mcp', '--isolation', 'network,auth'];
+  const LISTEN = ['--listen', '0.0.0.0:8080', '--agents-file', '/etc/agents.json'];
+
+  it('监听模式不需要 --principal-id；config.principal 缺省', () => {
+    const config = parseCliArgs([...BASE, ...HTTP, ...LISTEN], ENV);
+    expect(config.principal).toBeUndefined();
+    expect(config.listen).toEqual({ host: '0.0.0.0', port: 8080 });
+  });
+
+  it('非监听模式 --principal-id 仍必填', () => {
+    expect(() => parseCliArgs([...BASE, ...HTTP], ENV)).toThrow(/--principal-id/);
+  });
+
+  it('--listen 与 --agents-file 必须成对，且需要上游', () => {
+    expect(() => parseCliArgs([...BASE, ...HTTP, '--listen', '0.0.0.0:8080'], ENV)).toThrow(/--agents-file/);
+    expect(() => parseCliArgs([...BASE, ...HTTP, '--principal-id', 'p', '--agents-file', '/x'], ENV)).toThrow(/--listen/);
+    expect(() => parseCliArgs(['--base-url', 'https://a.example', '--policy', 'a/b', ...LISTEN], ENV)).toThrow(/上游/);
+  });
+
+  it.each([['8080'], ['host:'], ['host:0'], ['host:65536'], ['host:80a'], [':8080']])('非法 --listen %s', (value) => {
+    expect(() => parseCliArgs([...BASE, ...HTTP, '--listen', value, '--agents-file', '/x'], ENV)).toThrow(/--listen/);
+  });
+
+  it('IPv6 字面量', () => {
+    expect(parseCliArgs([...BASE, ...HTTP, '--listen', '[::]:9000', '--agents-file', '/x'], ENV).listen).toEqual({ host: '::', port: 9000 });
   });
 });

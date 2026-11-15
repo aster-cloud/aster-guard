@@ -1,0 +1,13 @@
+{
+  // 构建用：依赖根包的 dist（pnpm -r build 按拓扑序先构建根包）。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": false,
+    "sourceMap": true,
+    "paths": {}
+  },
+  "include": ["src/**/*"]
+}
