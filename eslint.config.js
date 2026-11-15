@@ -1,4 +1,4 @@
-// ESLint 9 flat config：src 与 test 的 TS 用 typescript-eslint recommended；
+// ESLint 9 flat config：src、test 与 examples 的 TS 用 typescript-eslint recommended；
 // 仓库内的 Node 脚本与测试夹具（.mjs）用 @eslint/js recommended，并声明 Node 全局变量。
 import js from '@eslint/js';
 import { defineConfig } from 'eslint/config';
@@ -7,10 +7,10 @@ import tseslint from 'typescript-eslint';
 
 export default defineConfig(
   {
-    ignores: ['dist/**', 'node_modules/**', 'coverage/**'],
+    ignores: ['**/dist/**', '**/node_modules/**', 'coverage/**'],
   },
   {
-    files: ['src/**/*.ts', 'test/**/*.ts'],
+    files: ['src/**/*.ts', 'test/**/*.ts', 'examples/*/src/**/*.ts', 'examples/*/test/**/*.ts'],
     extends: [tseslint.configs.recommended],
   },
   {

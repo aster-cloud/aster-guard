@@ -1,0 +1,23 @@
+{
+  "name": "@aster-cloud/aster-guard-demo-tool",
+  "version": "0.0.0",
+  "private": true,
+  "description": "演示 HTTP MCP 工具：auth 隔离的 consume 票据核对与副作用日志（aster-api ADR 0054 §12 D6）",
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "./dist/server.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@aster-cloud/aster-guard": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "^5.6"
+  }
+}

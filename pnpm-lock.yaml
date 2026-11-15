@@ -37,6 +37,22 @@ importers:
         specifier: ^5
         version: 5.0.3(@types/node@24.19.1)(vite@8.3.3(@types/node@24.19.1))
 
+  examples/http-demo-tool:
+    dependencies:
+      '@aster-cloud/aster-guard':
+        specifier: workspace:*
+        version: link:../..
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.32.1
+        version: 1.32.1(zod@4.6.5)
+    devDependencies:
+      '@types/node':
+        specifier: ^24
+        version: 24.19.1
+      typescript:
+        specifier: ^5.6
+        version: 5.9.3
+
 packages:
 
   '@eslint-community/eslint-utils@4.10.1':

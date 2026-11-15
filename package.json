@@ -41,8 +41,8 @@
     "build": "tsc",
     "prepublishOnly": "pnpm run build",
     "test": "pnpm run build && vitest run",
-    "lint": "eslint src test scripts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "lint": "eslint src test scripts examples",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc -p examples/http-demo-tool/tsconfig.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

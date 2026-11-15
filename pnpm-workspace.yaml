@@ -1,0 +1,3 @@
+# 根包即 @aster-cloud/aster-guard；examples/* 为不发布的示例（演示 HTTP 工具等），以 workspace:* 依赖根包。
+packages:
+  - 'examples/*'
