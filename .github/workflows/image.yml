@@ -169,7 +169,7 @@ jobs:
   # latest-only）对每次 head 要求 sourceSha == 本仓 main 当前 HEAD，否则拒绝；合并用 --match-head-commit
   # 锁定已验证的 head。main 前进后更新的运行会强推同一固定分支，旧 digest 的 head 随之作废。
   # 剩余窗口（验证通过后、合并前 main 恰好前进）与所有源仓共用同一脚本，修正应在上游统一做；
-  # 其后果是集群短暂运行「同样来自 main、同样签名」的上一个 digest，直到更新的 run 再次 pin（最终一致）。
+  # 其后果是集群短暂停留在「最近一次成功 pin 的、同样来自 main 且同样签名」的 digest，直到更新的 run 再次 pin（最终一致）。
   # 前置（用户，U-G2）：Environment image-pin（部署分支仅 main）内 vars.IMAGE_PIN_APP_CLIENT_ID 与
   # secrets.IMAGE_PIN_APP_PRIVATE_KEY。k3s 侧尚无对应 lock / 信任根时 verify-image-pin 拒绝、本 job 红（预期）。
   image-pin-pr:
