@@ -38,8 +38,8 @@ describe('包入口（dist 产物）', () => {
     expect(exportedNames('@aster-cloud/aster-guard').sort()).toEqual(['GuardClient', 'JcsError', 'VERSION', 'canonicalize', 'hashAction', 'jcsSha256', 'parseStrictJson']);
   });
 
-  it('子路径 @aster-cloud/aster-guard/mcp 经 exports 解析，运行时只导出 createGuardProxyServer', () => {
-    expect(exportedNames('@aster-cloud/aster-guard/mcp')).toEqual(['createGuardProxyServer']);
+  it('子路径 @aster-cloud/aster-guard/mcp 经 exports 解析，运行时只导出代理工厂、HTTP 服务端与登记读取', () => {
+    expect(exportedNames('@aster-cloud/aster-guard/mcp').sort()).toEqual(['createGuardProxyServer', 'loadAgents', 'startHttpProxy']);
   });
 
   it('子路径 @aster-cloud/aster-guard/tool 导出 consume 票据核对（auth 隔离，ADR 0054 §3.3）', () => {

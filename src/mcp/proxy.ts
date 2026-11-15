@@ -77,6 +77,11 @@ export interface GuardProxyOptions {
   tools?: string[];
   /** 按工具的 action 映射。 */
   actions?: Record<string, ActionMapping>;
+  /**
+   * 上游工具名缓存；缺省每个代理实例自建。监听模式每个请求新建一个代理实例，共享同一缓存，
+   * 避免每次 tools/call 都向上游刷新 tools/list。
+   */
+  toolNames?: ToolNameCache;
   /** 仅测试：consume 之前调用，入参为将被转发的参数对象（绕过套件 #3）。CLI 不暴露。 */
   __beforeConsume?: (args: Record<string, unknown>) => void;
 }
@@ -131,7 +136,7 @@ function installGovernanceTools(server: Server, options: GuardProxyOptions): voi
 function installGuardedUpstream(server: Server, upstream: UpstreamClient, options: ResolvedOptions): void {
   const timeout = options.upstreamTimeoutMs;
   const allow = options.tools === undefined ? undefined : new Set(options.tools);
-  const knownTools = new UpstreamToolNames(upstream, timeout);
+  const knownTools = options.toolNames ?? createToolNameCache(upstream, timeout);
   const exposed = (tool: Tool) => allow === undefined || allow.has(tool.name);
 
   server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
@@ -251,17 +256,28 @@ function relayProgress(
   };
 }
 
+/** 上游工具名缓存：记下 tools/list 的结果，按名取工具定义（未知为 undefined）。 */
+export interface ToolNameCache {
+  remember(tools: Tool[]): void;
+  get(name: string): Promise<Tool | undefined>;
+}
+
+/** 新建上游工具名缓存；timeoutMs 为刷新 tools/list 的请求超时。 */
+export function createToolNameCache(upstream: Pick<UpstreamClient, 'listTools'>, timeoutMs: number): ToolNameCache {
+  return new UpstreamToolNames(upstream, timeoutMs);
+}
+
 /**
  * 上游工具名缓存，用于拒绝未知工具。tools/list 转发时与完整刷新时都会记下工具名；命中缓存不访问上游。
  * 未命中时（客户端可能不先 tools/list 就调用，上游工具集也可能已变化）每次调用至多做一次完整刷新，
  * 并发的未命中共享同一次刷新。
  */
-class UpstreamToolNames {
+class UpstreamToolNames implements ToolNameCache {
   private readonly names = new Map<string, Tool>();
   private refreshing: Promise<void> | undefined;
 
   constructor(
-    private readonly upstream: UpstreamClient,
+    private readonly upstream: Pick<UpstreamClient, 'listTools'>,
     private readonly timeout: number,
   ) {}
 

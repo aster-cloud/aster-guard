@@ -332,3 +332,33 @@ describe('HTTP 上游与 --isolation 列表（ADR 0054 §12 D1/D4）', () => {
     }
   });
 });
+
+describe('监听模式 --listen / --agents-file（ADR 0054 §12 D4）', () => {
+  const BASE = ['--base-url', 'https://api.example.com', '--policy', 'guard.demo/decide', '--tenant-id', 't'];
+  const HTTP = ['--upstream-url', 'http://tool:8080/mcp', '--isolation', 'network,auth'];
+  const LISTEN = ['--listen', '0.0.0.0:8080', '--agents-file', '/etc/agents.json'];
+
+  it('监听模式不需要 --principal-id；config.principal 缺省', () => {
+    const config = parseCliArgs([...BASE, ...HTTP, ...LISTEN], ENV);
+    expect(config.principal).toBeUndefined();
+    expect(config.listen).toEqual({ host: '0.0.0.0', port: 8080 });
+  });
+
+  it('非监听模式 --principal-id 仍必填', () => {
+    expect(() => parseCliArgs([...BASE, ...HTTP], ENV)).toThrow(/--principal-id/);
+  });
+
+  it('--listen 与 --agents-file 必须成对，且需要上游', () => {
+    expect(() => parseCliArgs([...BASE, ...HTTP, '--listen', '0.0.0.0:8080'], ENV)).toThrow(/--agents-file/);
+    expect(() => parseCliArgs([...BASE, ...HTTP, '--principal-id', 'p', '--agents-file', '/x'], ENV)).toThrow(/--listen/);
+    expect(() => parseCliArgs(['--base-url', 'https://a.example', '--policy', 'a/b', ...LISTEN], ENV)).toThrow(/上游/);
+  });
+
+  it.each([['8080'], ['host:'], ['host:0'], ['host:65536'], ['host:80a'], [':8080']])('非法 --listen %s', (value) => {
+    expect(() => parseCliArgs([...BASE, ...HTTP, '--listen', value, '--agents-file', '/x'], ENV)).toThrow(/--listen/);
+  });
+
+  it('IPv6 字面量', () => {
+    expect(parseCliArgs([...BASE, ...HTTP, '--listen', '[::]:9000', '--agents-file', '/x'], ENV).listen).toEqual({ host: '::', port: 9000 });
+  });
+});

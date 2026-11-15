@@ -189,6 +189,29 @@ stdio MCP 服务器（ADR 0040 §6；`--listen` 时为 Streamable HTTP，见下�
 
 要在宿主侧程序里嵌入代理（自行提供 transport 与已连接的上游 `Client`），可从子路径导入：`import { createGuardProxyServer } from '@aster-cloud/aster-guard/mcp'`，选项与 CLI 参数一一对应（`approvalTimeoutMs`、`upstreamTimeoutMs`、`resourceFromArg`、`agentModel`）。
 
+### Streamable HTTP 模式（ADR 0054 §3.1、§12 D4）
+
+`--listen <host>:<port>` 让代理以**无状态** Streamable HTTP 提供服务，适合把代理部署成独立服务、模型与原始工具分处不同网络位置（如 k3s 的 `aster-agents → aster-guard → aster-tools`）：
+
+```bash
+ASTER_GUARD_API_KEY=… aster-guard-mcp --listen 0.0.0.0:8080 \
+  --upstream-url http://demo-tool.aster-tools.svc.cluster.local:8080/mcp --isolation network,auth \
+  --base-url http://aster-api.aster-cloud.svc.cluster.local --policy guard.demo/decide --tenant-id <团队> \
+  --tools demo_echo,demo_delete --agents-file /etc/aster-guard/agents.json
+```
+
+| 路径 | 行为 |
+|---|---|
+| `POST /mcp` | `Authorization: Bearer <token>` 必须匹配登记项，否则 `401 {"error":"unauthorized"}` + `WWW-Authenticate: Bearer`（不建 MCP 服务器、不访问 Guard）；请求体超过 1 MiB → `413`；非 JSON → `400`。通过后为这一个请求新建代理 MCP 服务器与 transport（`enableJsonResponse`），响应结束即关闭 |
+| `GET` / `DELETE /mcp` | `405`（无状态：没有会话与服务端推送流） |
+| `GET /healthz` | `200 ok`（进程存活，用作 liveness） |
+| `GET /readyz` | 最近 30 秒内上游 `tools/list`（3 秒超时）成功过即 `200`，否则 `503`；结论缓存 10 秒，并发请求共享一次探测（用作 readiness） |
+
+- **Agent 登记**（`--agents-file`）：`{ "agents": [{ "id": "…", "tokenSha256": "<64 位小写十六进制>", "principalId"?: "…", "principalRoles"?: ["…"] }] }`。只存 token 的 sha256，`id` 与 `tokenSha256` 各自唯一，未知键报错。鉴权对每一项做定长比较、不提前返回。每个 Agent 以自己的主体 `{ id: principalId ?? id, type: "agent", roles? }` 裁决，所以监听模式不接受 `--principal-id / --principal-type / --principal-roles`。
+- 上游连接与工具名缓存跨请求共享：连续的 `tools/call` 不会每次都向上游刷新 `tools/list`。
+- `SIGTERM` / `SIGINT`：停止接受新连接，等在途请求结束（至多 5 秒）后关闭上游，以 `0` 退出。
+- 嵌入：`import { startHttpProxy, loadAgents } from '@aster-cloud/aster-guard/mcp'`。
+
 ### 客户端配置
 
 Claude Desktop 配置示例（`claude_desktop_config.json`）：

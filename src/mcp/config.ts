@@ -30,7 +30,7 @@ guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject
 必填：
   --base-url <url>              aster-api 根地址，如 https://api.aster-lang.cloud
   --policy <module>/<function>  裁决所用的策略，如 guard.customer/decide
-  --principal-id <id>           发起主体 id，如 agent-42
+  --principal-id <id>           发起主体 id，如 agent-42（stdio 服务模式必填；监听模式不接受）
 
 选项：
   --upstream "<cmd> [args…]"    上游 MCP 服务器的启动命令，按 shell 规则切分（支持引号与反斜杠转义）
@@ -67,6 +67,13 @@ guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject
   --executor-id <id>            对账用执行方标识，缺省 aster-guard-mcp@<hostname>（≤ 255 字符、无控制字符）
   -h, --help                    显示本帮助
 
+Streamable HTTP 监听模式（ADR 0054 §3.1、§12 D4；须有上游）：
+  --listen <host>:<port>        以无状态 Streamable HTTP 在该地址提供服务：POST /mcp（Bearer 鉴权），
+                                GET /healthz（进程存活）、GET /readyz（最近 30 秒内上游 tools/list 成功过）
+  --agents-file <file.json>     Agent 登记 { "agents": [{ "id", "tokenSha256", "principalId"?, "principalRoles"? }] }；
+                                只存 token 的 sha256（64 位小写十六进制）；每个 Agent 以自己的 principal 裁决，
+                                因此监听模式不接受 --principal-id / --principal-type / --principal-roles
+
 --principal-id / --principal-type / --agent-model 与每个角色须为 1–${MAX_TEXT_LENGTH} 字符且不含控制字符
 （aster-api 对 Action 文本字段的限制），否则以参数错误退出。
 
@@ -96,7 +103,12 @@ export interface ProxyConfig {
   apiKey: string;
   policyModule: string;
   policyFunction: string;
-  principal: GuardPrincipal;
+  /** stdio 服务模式的主体；监听模式缺省（每个 Agent 的 principal 取自 --agents-file）。 */
+  principal?: GuardPrincipal;
+  /** 监听模式：以无状态 Streamable HTTP 在该地址提供服务。 */
+  listen?: { host: string; port: number };
+  /** 监听模式：Agent 登记文件路径（ADR 0054 §12 D4）。 */
+  agentsFile?: string;
   approvalTimeoutMs: number;
   upstreamTimeoutMs: number;
   resourceFromArg?: string;
@@ -117,6 +129,8 @@ const OPTIONS = {
   upstream: { type: 'string' },
   'upstream-url': { type: 'string' },
   'upstream-auth-env': { type: 'string' },
+  listen: { type: 'string' },
+  'agents-file': { type: 'string' },
   'base-url': { type: 'string' },
   'api-key-env': { type: 'string' },
   policy: { type: 'string' },
@@ -191,13 +205,15 @@ const CliSchema = z.object({
     .url({ protocol: /^https?$/, error: '--upstream-url 须为 http(s) URL' })
     .optional(),
   'upstream-auth-env': optionalText('upstream-auth-env'),
+  listen: optionalText('listen'),
+  'agents-file': optionalText('agents-file'),
   'base-url': z.url({
     protocol: /^https?$/,
     error: (issue) => (issue.input === undefined ? '缺少必填参数 --base-url' : '--base-url 须为 http(s) URL'),
   }),
   'api-key-env': optionalText('api-key-env'),
   policy: requiredText('policy').regex(/^[^/\s]+\/[^/\s]+$/, '--policy 须为 <module>/<function>，如 guard.customer/decide'),
-  'principal-id': actionText(requiredText('principal-id'), '--principal-id'),
+  'principal-id': actionText(z.string().trim().min(1, '--principal-id 不能为空'), '--principal-id').optional(),
   'principal-type': actionText(z.string().trim().min(1, '--principal-type 不能为空'), '--principal-type').optional(),
   'principal-roles': rolesList.optional(),
   'approval-timeout': z
@@ -264,9 +280,13 @@ export function wantsHelp(argv: readonly string[]): boolean {
  * 帮助请求先用 {@link wantsHelp} 判断。
  */
 export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): ProxyConfig {
-  const parsed = CliSchema.safeParse(readOptions(argv));
-  if (!parsed.success) {
-    throw new ConfigError(['参数有误：', ...parsed.error.issues.map((issue) => `  - ${issue.message}`)].join('\n'));
+  const raw = readOptions(argv);
+  const parsed = CliSchema.safeParse(raw);
+  const issues = parsed.success ? [] : parsed.error.issues.map((issue) => issue.message);
+  // stdio 服务模式 --principal-id 必填（监听模式取自 --agents-file），与其它缺失的必填参数一并列出。
+  if (raw.listen === undefined && raw['principal-id'] === undefined) issues.push('缺少必填参数 --principal-id');
+  if (!parsed.success || issues.length > 0) {
+    throw new ConfigError(['参数有误：', ...issues.map((message) => `  - ${message}`)].join('\n'));
   }
   const options = parsed.data;
   const apiKeyEnv = options['api-key-env'] ?? DEFAULT_API_KEY_ENV;
@@ -277,7 +297,6 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
   const [policyModule, policyFunction] = options.policy.split('/');
   const upstream = upstreamSpec(options, env, apiKeyEnv);
   const execution = executionConfig(options, upstream !== undefined);
-  const roles = options['principal-roles'];
   return {
     ...(upstream === undefined ? {} : { upstream }),
     baseUrl: options['base-url'],
@@ -285,11 +304,7 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
     apiKey,
     policyModule,
     policyFunction,
-    principal: {
-      id: options['principal-id'],
-      type: options['principal-type'] ?? 'agent',
-      ...(roles?.length ? { roles } : {}),
-    },
+    ...servingConfig(options, upstream !== undefined),
     approvalTimeoutMs: Math.round(Number(options['approval-timeout'] ?? DEFAULT_APPROVAL_TIMEOUT_SECONDS) * 1000),
     upstreamTimeoutMs: (options['upstream-timeout'] ?? DEFAULT_UPSTREAM_TIMEOUT_SECONDS) * 1000,
     ...(options['resource-from'] === undefined ? {} : { resourceFromArg: options['resource-from'] }),
@@ -299,6 +314,43 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
 }
 
 type CliOptions = z.infer<typeof CliSchema>;
+
+/**
+ * 服务方式：缺省 stdio，principal 来自 --principal-*（--principal-id 必填）；--listen 为监听模式，
+ * 须有上游与 --agents-file，且不接受 --principal-*——每个 Agent 的 principal 取自登记文件。
+ */
+function servingConfig(options: CliOptions, hasUpstream: boolean): Pick<ProxyConfig, 'principal' | 'listen' | 'agentsFile'> {
+  const { listen, 'agents-file': agentsFile } = options;
+  if (listen === undefined) {
+    if (agentsFile !== undefined) throw new ConfigError('--agents-file 只用于监听模式（需同时指定 --listen）');
+    const roles = options['principal-roles'];
+    return {
+      principal: {
+        // parseCliArgs 已保证非监听模式有 --principal-id。
+        id: options['principal-id'] as string,
+        type: options['principal-type'] ?? 'agent',
+        ...(roles?.length ? { roles } : {}),
+      },
+    };
+  }
+  if (!hasUpstream) throw new ConfigError('监听模式需要上游（--upstream 或 --upstream-url）');
+  if (agentsFile === undefined) throw new ConfigError('监听模式缺少必填参数 --agents-file');
+  const misplaced = (['principal-id', 'principal-type', 'principal-roles'] as const).filter((k) => options[k] !== undefined);
+  if (misplaced.length > 0) {
+    throw new ConfigError(`${misplaced.map((k) => `--${k}`).join(' / ')} 不能用于监听模式：监听模式的 principal 取自 --agents-file`);
+  }
+  return { listen: parseListen(listen), agentsFile };
+}
+
+/** `<host>:<port>` 或 `[<ipv6>]:<port>`，端口 1–65535。 */
+function parseListen(value: string): { host: string; port: number } {
+  const m = /^(?:\[([^\]]+)\]|([^:[\]]+)):(\d{1,5})$/.exec(value);
+  const port = m ? Number(m[3]) : NaN;
+  if (!m || !(port >= 1 && port <= 65535)) {
+    throw new ConfigError(`--listen 须为 <host>:<port>（端口 1–65535），如 0.0.0.0:8080：${value}`);
+  }
+  return { host: m[1] ?? m[2], port };
+}
 
 /**
  * 上游：--upstream（stdio）与 --upstream-url（HTTP）二选一；--upstream-auth-env 只配 --upstream-url，
