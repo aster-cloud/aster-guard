@@ -4,4 +4,4 @@ export { canonicalize, hashAction, jcsSha256, JcsError, parseStrictJson } from '
 export type { JcsErrorCode } from './hash/jcs.js';
 export type * from './types.js';
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';

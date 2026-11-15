@@ -1,6 +1,6 @@
 {
   "name": "@aster-cloud/aster-guard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Aster Action Guard 的 TypeScript 客户端（GuardClient）与 MCP 代理（aster-guard-mcp）",
   "type": "module",
   "license": "Apache-2.0",

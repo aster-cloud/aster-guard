@@ -7,11 +7,11 @@ AI Agent 在执行有副作用的动作之前（删除客户记录、转账、�
 本包提供两样东西：
 
 - **`GuardClient`**：调用 aster-api `/api/v1/guard/*` 的 TypeScript SDK。
-- **`aster-guard-mcp`**：stdio MCP 代理。包在任意上游 MCP 服务器外面，对每一次 `tools/call` 先过 guard，再决定是否转发。
+- **`aster-guard-mcp`**：MCP 代理（stdio，或 `--listen` 时为 Streamable HTTP 服务）。包在任意上游 MCP 服务器（stdio 子进程或 HTTP）外面，对每一次 `tools/call` 先过 guard，再决定是否转发。
 
 设计依据见 aster-api 仓库 `docs/adr/0040-action-guard.md`（ADR 0040：Action Guard，本包对应 §6），随子项目 2 合并后可见。
 
-> **当前状态：0.2.0（执行点，aster-api ADR 0054 / R66），尚未发布。** 0.1.0 从未发布。0.2.0 起 Guard 是**执行点**而不是建议：只有本次决策的执行收据验签通过且 consume 成功，动作才会执行。行为变化见文末「0.2.0 行为变化」。
+> **当前状态：0.3.0（HTTP 上游 / 监听模式与 R68 策略地址核对，要求 aster-api 已上线 ADR 0040 §13 R68，见「服务端版本要求与回滚」）。** 0.2.0 已发布（执行点，aster-api ADR 0054 / R66）；0.1.0 从未发布。0.2.0 起 Guard 是**执行点**而不是建议：只有本次决策的执行收据验签通过且 consume 成功，动作才会执行。行为变化见文末「0.3.0 行为变化」与「0.2.0 行为变化」。
 
 ## 安装
 
@@ -450,11 +450,17 @@ pnpm run build       # tsc → dist/
 
 ## 服务端版本要求与回滚
 
-自本版本（R68 地址核对）起，执行方（`GuardClient.run`、`verifyReceipt`、`aster-guard-mcp`）**要求 aster-api 已上线 ADR 0040 §13 R68**（执行收据签名载荷含 `policyModule / policyFunction`，aster-api#539）。缺这两键的收据——R68 之前的 aster-api 签发的，或 R68 上线前已签发、尚在 5 分钟 TTL 内的——一律 `blocked receipt_invalid`（`policy_mismatch`），不 consume、不执行：fail-closed，不会误放行，但全部受守卫动作停摆。
+自 0.3.0（R68 地址核对）起，执行方（`GuardClient.run`、`verifyReceipt`、`aster-guard-mcp`）**要求 aster-api 已上线 ADR 0040 §13 R68**（执行收据签名载荷含 `policyModule / policyFunction`，aster-api#539）。缺这两键的收据——R68 之前的 aster-api 签发的，或 R68 上线前已签发、尚在 5 分钟 TTL 内的——一律 `blocked receipt_invalid`（`policy_mismatch`），不 consume、不执行：fail-closed，不会误放行，但全部受守卫动作停摆。
 
 - **升级顺序**：先部署含 R68 的 aster-api，**至少等一个收据 TTL（5 分钟）** 让无地址键的旧收据过期，再升级执行方。0.2.x 执行方在 R68 服务端上照常工作（新增键在签名字节内，0.2.x 不读它们）。
 - **回滚耦合**：aster-api 回滚到 R68 之前（或自托管的 aster-api 没有 R68）时，执行方必须同时钉回 npm 上已发布的 `@aster-cloud/aster-guard@0.2.0`（不含本项核对）；`aster-guard-mcp` 代理镜像钉回本项合入 main 之前构建的镜像 digest。否则全部 `policy_mismatch`。
 - 工具侧 `verifyConsumeTicket` 不读收据地址键，不受此耦合影响。
+
+## 0.3.0 行为变化
+
+- ALLOW 收据须带签名覆盖的 `policyModule / policyFunction` 且等于自身配置的策略，否则 `blocked receipt_invalid`（`policy_mismatch`）；要求 aster-api 已上线 R68，回滚耦合见上文「服务端版本要求与回滚」。
+- 新增 `--upstream-url` / `--upstream-auth-env`（HTTP 上游）、`--listen` / `--agents-file`（Streamable HTTP 监听，`/healthz`、`/readyz`）；`--isolation` 接受 `network,auth` 列表。
+- 监听模式下 HTTP 上游不可达不再退出，后台退避重连；未就绪时 `tools/call` 以 `upstream_unavailable` 拒绝。
 
 ## 0.2.0 行为变化
 
