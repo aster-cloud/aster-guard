@@ -23,7 +23,7 @@ const TOOL_LIST_TIMEOUT_MS = 30_000;
 export interface HttpProxyOptions {
   listen: { host: string; port: number };
   agents: readonly AgentEntry[];
-  /** 已连接的上游；由调用方在 close() 之后自行关闭。 */
+  /** 已连接的上游，或带 ready() 的重连监督器（CLI 对 HTTP 上游用后者）；由调用方在 close() 之后自行关闭。 */
   upstream: UpstreamClient;
   /** 每个 Agent 的代理选项，启动时每个 Agent 调用一次。返回值中的 principal 会被登记项覆盖。 */
   makeProxyOptions: (agent: AgentEntry) => Omit<GuardProxyOptions, 'upstream'>;
@@ -52,6 +52,7 @@ export async function startHttpProxy(opts: HttpProxyOptions): Promise<HttpProxy>
   const shared: UpstreamClient = {
     listTools: (...args) => upstream.listTools(...args),
     callTool: (...args) => upstream.callTool(...args),
+    ready: () => upstream.ready?.() ?? true,
     close: async () => undefined,
   };
   const toolNames = createToolNameCache(upstream, TOOL_LIST_TIMEOUT_MS);
@@ -129,6 +130,8 @@ export async function startHttpProxy(opts: HttpProxyOptions): Promise<HttpProxy>
 /**
  * /readyz 判定：结论缓存 READY_CACHE_MS，过期后至多一次在途探测（并发共享）；
  * 最近一次成功的探测在 READY_WINDOW_MS 内即就绪——容忍上游短暂抖动，持续不可用则摘流。
+ * 上游带 ready()（监听模式的重连监督）且为 false 时直接不就绪、不探测：此时 tools/call 一律被拒，
+ * 不能因为窗口内的旧成功而继续接流。探测本身的连接级失败也会让监督器判定断开。
  */
 function readiness(upstream: UpstreamClient, now: () => number): () => Promise<boolean> {
   let lastProbeAt = -Infinity;
@@ -145,11 +148,12 @@ function readiness(upstream: UpstreamClient, now: () => number): () => Promise<b
     }
   };
   return async () => {
+    if (upstream.ready?.() === false) return false;
     if (now() - lastProbeAt >= READY_CACHE_MS) {
       probing ??= probe().finally(() => (probing = undefined));
       await probing;
     }
-    return now() - lastSuccessAt <= READY_WINDOW_MS;
+    return upstream.ready?.() !== false && now() - lastSuccessAt <= READY_WINDOW_MS;
   };
 }
 

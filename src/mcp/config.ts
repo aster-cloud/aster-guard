@@ -69,7 +69,9 @@ guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject
 
 Streamable HTTP 监听模式（ADR 0054 §3.1、§12 D4；须有上游）：
   --listen <host>:<port>        以无状态 Streamable HTTP 在该地址提供服务：POST /mcp（Bearer 鉴权），
-                                GET /healthz（进程存活）、GET /readyz（最近 30 秒内上游 tools/list 成功过）
+                                GET /healthz（进程存活）、GET /readyz（最近 30 秒内上游 tools/list 成功过）；
+                                --upstream-url 连不上或断开时不退出：后台退避重连（0.5 秒起、封顶 30 秒），
+                                未就绪期间 readyz 为 503，tools/call 不裁决、以 upstream_unavailable 拒绝
   --agents-file <file.json>     Agent 登记 { "agents": [{ "id", "tokenSha256", "principalId"?, "principalRoles"? }] }；
                                 只存 token 的 sha256（64 位小写十六进制）；每个 Agent 以自己的 principal 裁决，
                                 因此监听模式不接受 --principal-id / --principal-type / --principal-roles

@@ -550,6 +550,64 @@ describe('aster-guard-mcp 代理：上游超时与 progress 转发', () => {
   });
 });
 
+describe('aster-guard-mcp 代理：上游未就绪（ready() 为 false）', () => {
+  /** 直接以 InMemory 连接代理；上游是带 ready() 的桩，记录是否被触达。 */
+  async function rig(ready: () => boolean, tools?: string[]) {
+    const guard = mockGuard();
+    const upstream = {
+      ready,
+      listTools: vi.fn(async () => ({ tools: UPSTREAM_TOOLS })),
+      callTool: vi.fn(async () => ({ content: [{ type: 'text', text: 'executed' }] })),
+      close: vi.fn(async () => undefined),
+    };
+    const proxy = createGuardProxyServer({
+      client: guard as unknown as GuardClientLike,
+      upstream: upstream as unknown as GuardProxyOptions['upstream'],
+      principal: PRINCIPAL,
+      ...(tools ? { tools } : {}),
+    });
+    const [agentSide, proxySide] = InMemoryTransport.createLinkedPair();
+    await proxy.server.connect(proxySide);
+    const agent = new Client({ name: 'agent', version: '0.0.0' });
+    await agent.connect(agentSide);
+    cleanups.push(async () => {
+      await agent.close();
+      await proxy.close();
+    });
+    return { agent, guard, upstream };
+  }
+
+  it('upstreamUnavailableFailsClosedBeforeDecision：不裁决、不转发、不刷新工具列表', async () => {
+    const { agent, guard, upstream } = await rig(() => false);
+    const result = (await agent.callTool({ name: 'delete_customer', arguments: { customerId: 'C-1' } })) as CallToolResult;
+
+    expect(result.isError).toBe(true);
+    expect(result._meta?.asterGuard).toEqual({
+      status: 'blocked',
+      reasonCode: 'upstream_unavailable',
+      reason: '上游 MCP 服务器暂不可用（正在重连），本次调用未裁决、未转发',
+    });
+    expect(textOf(result)).toMatch(/^Blocked by Aster Guard: 上游 MCP 服务器暂不可用/);
+    for (const fn of Object.values(guard)) expect(fn).not.toHaveBeenCalled();
+    expect(upstream.callTool).not.toHaveBeenCalled();
+    expect(upstream.listTools).not.toHaveBeenCalled();
+  });
+
+  it('白名单外的工具仍是 Unknown tool（白名单先于就绪判定）', async () => {
+    const { agent, guard } = await rig(() => false, ['echo']);
+    await expect(agent.callTool({ name: 'delete_customer', arguments: {} })).rejects.toMatchObject({ code: ErrorCode.InvalidParams });
+    expect(guard.run).not.toHaveBeenCalled();
+  });
+
+  it('ready() 为 true 时照常经 GuardClient.run', async () => {
+    const { agent, guard } = await rig(() => true);
+    guard.run.mockResolvedValue({ kind: 'blocked', decision: { decisionId: 'd-1', outcome: 'DENY', effectiveOutcome: 'DENY', reason: 'no' } });
+    const result = (await agent.callTool({ name: 'echo', arguments: {} })) as CallToolResult;
+    expect(guard.run).toHaveBeenCalledTimes(1);
+    expect(result._meta?.asterGuard).toMatchObject({ status: 'denied', decisionId: 'd-1' });
+  });
+});
+
 describe('createGuardProxyServer.close', () => {
   it('关闭上游且只关闭一次：连续两次 close()，假上游的 onclose 只触发一次', async () => {
     const { proxy, fakeUpstream } = await setup();

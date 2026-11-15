@@ -22,7 +22,7 @@ import { BEFORE_CONSUME } from '../internal/hooks.js';
 import type { GuardGrant, GuardPrincipal, GuardRunOptions } from '../types.js';
 import { CONSUME_TICKET_META_KEY } from '../tool/consume-ticket.js';
 import { buildToolAction, canonicalArgs, envelopeOf, type ActionMapping } from './action-mapping.js';
-import { blockedResult, pendingResult, refusedResult, withGuardMeta } from './guard-result.js';
+import { blockedResult, pendingResult, refusedResult, unavailableResult, withGuardMeta } from './guard-result.js';
 import { callGovernanceTool, GOVERNANCE_TOOLS } from './standalone-tools.js';
 
 /** 缺省的人工审批等待时长（§6：`--approval-timeout` 缺省 300 秒）。 */
@@ -46,8 +46,12 @@ export type GuardClientLike = Pick<
   'check' | 'get' | 'waitFor' | 'listApprovals' | 'approve' | 'reject' | 'run' | 'consume' | 'reportResult' | 'verifyReceipt' | 'keys'
 >;
 
-/** 代理用到的上游 Client 方法；代理接管其生命周期，close() 时一并关闭。 */
-export type UpstreamClient = Pick<Client, 'listTools' | 'callTool' | 'close'>;
+/**
+ * 代理用到的上游 Client 方法；代理接管其生命周期，close() 时一并关闭。
+ * `ready` 可选：给出且为 false 时 tools/call 在裁决之前即以 `upstream_unavailable` 拒绝（监听模式的重连监督，
+ * upstream-supervisor.ts）；缺省视为总是就绪（直接传入的 Client）。
+ */
+export type UpstreamClient = Pick<Client, 'listTools' | 'callTool' | 'close'> & { ready?(): boolean };
 
 /** 原始工具端点的隔离方式（ADR 0054 §3.1–§3.3、§12 D1）。 */
 export type Isolation = 'network' | 'auth';
@@ -147,7 +151,13 @@ function installGuardedUpstream(server: Server, upstream: UpstreamClient, option
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name } = request.params;
-    const tool = allow === undefined || allow.has(name) ? await knownTools.get(name) : undefined;
+    const allowed = allow === undefined || allow.has(name);
+    // 上游未就绪：不裁决、不转发。工具定义未知时不放 structuredContent（无从得知它是否声明了 outputSchema）。
+    if (allowed && upstream.ready?.() === false) {
+      const cached = knownTools.peek?.(name);
+      return unavailableResult(cached === undefined || cached.outputSchema !== undefined);
+    }
+    const tool = allowed ? await knownTools.get(name) : undefined;
     if (!tool) {
       throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
     }
@@ -260,6 +270,8 @@ function relayProgress(
 export interface ToolNameCache {
   remember(tools: Tool[]): void;
   get(name: string): Promise<Tool | undefined>;
+  /** 只查缓存、不访问上游；未缓存为 undefined。 */
+  peek?(name: string): Tool | undefined;
 }
 
 /** 新建上游工具名缓存；timeoutMs 为刷新 tools/list 的请求超时。 */
@@ -283,6 +295,10 @@ class UpstreamToolNames implements ToolNameCache {
 
   remember(tools: Tool[]): void {
     for (const tool of tools) this.names.set(tool.name, tool);
+  }
+
+  peek(name: string): Tool | undefined {
+    return this.names.get(name);
   }
 
   /** 取工具定义（含 outputSchema）；未知工具为 undefined。 */

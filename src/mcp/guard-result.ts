@@ -15,6 +15,7 @@ const BLOCKING_CODES = new Set([
   'cancelled',
   'wait_aborted',
   'idempotency_mismatch',
+  'upstream_unavailable',
 ]);
 
 /** 载荷位置：总在 `_meta.asterGuard`；上游工具未声明 outputSchema 时另放 structuredContent（D4）。 */
@@ -67,6 +68,23 @@ export function blockedResult(d: GuardDecision, hasOutputSchema: boolean): CallT
   return guardResult(
     { status: 'blocked', decisionId: d.decisionId || undefined, reasonCode: d.reasonCode, reason: d.reason },
     d,
+    hasOutputSchema,
+  );
+}
+
+/**
+ * 上游未就绪（监听模式下启动后尚未连上，或断开后重连中）：在裁决之前拒绝，没有决策、没有 consume、不转发。
+ * 是否重试由调用方决定；代理不会替它排队或延后执行。
+ */
+export function unavailableResult(hasOutputSchema: boolean): CallToolResult {
+  return blockedResult(
+    {
+      decisionId: '',
+      outcome: 'DENY',
+      effectiveOutcome: 'DENY',
+      reasonCode: 'upstream_unavailable',
+      reason: '上游 MCP 服务器暂不可用（正在重连），本次调用未裁决、未转发',
+    },
     hasOutputSchema,
   );
 }
