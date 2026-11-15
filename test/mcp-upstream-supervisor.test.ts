@@ -221,6 +221,21 @@ describe('superviseUpstream', () => {
     await expect(upstream.callTool({ name: 'echo', arguments: {} })).rejects.toBeInstanceOf(UpstreamUnavailableError);
   });
 
+  it('close() 时连接 / 验证仍在途：之后才成功的连接被直接关闭，不会就绪', async () => {
+    const conn = fakeConnection(0);
+    let finishVerify!: () => void;
+    conn.listBehaviour = () => new Promise((resolve) => (finishVerify = () => resolve({ tools: TOOLS })));
+    const connect = vi.fn(async () => conn as unknown as UpstreamConnection);
+    const { upstream } = supervise(connect);
+    await vi.waitFor(() => expect(conn.lists).toBe(1));
+
+    await upstream.close();
+    finishVerify();
+    await vi.waitFor(() => expect(conn.closed).toBe(true));
+    expect(upstream.ready()).toBe(false);
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
   it('close() 关闭已就绪的连接', async () => {
     const { connect, made } = connector();
     const { upstream } = supervise(connect);
