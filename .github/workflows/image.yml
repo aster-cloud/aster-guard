@@ -165,6 +165,10 @@ jobs:
         run: *verify-sig
 
   # 经 image-pin App（id 4253193）向 k3s 开 pin PR；脚本等 k3s 的 verify-image-pin 通过后自行合并。
+  # 新鲜度：本 job 的 Final stale gate 只是减少噪音；真正的闸在 k3s——verify-image-pin 规则 3（freshness
+  # latest-only）对每次 head 要求 sourceSha == 本仓 main 当前 HEAD，否则拒绝；合并用 --match-head-commit
+  # 锁定已验证的 head。main 前进后更新的运行会强推同一固定分支，旧 digest 的 head 随之作废。
+  # 剩余窗口（验证通过后、合并前 main 恰好前进）与所有源仓共用同一脚本，修正应在上游统一做。
   # 前置（用户，U-G2）：Environment image-pin（部署分支仅 main）内 vars.IMAGE_PIN_APP_CLIENT_ID 与
   # secrets.IMAGE_PIN_APP_PRIVATE_KEY。k3s 侧尚无对应 lock / 信任根时 verify-image-pin 拒绝、本 job 红（预期）。
   image-pin-pr:
