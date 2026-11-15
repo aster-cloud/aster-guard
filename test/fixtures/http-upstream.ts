@@ -27,8 +27,8 @@ const ECHO = {
   inputSchema: { type: 'object' as const, properties: { text: { type: 'string' } } },
 };
 
-/** 每个请求新建 Server 与 transport（无状态模式的用法）；GET / DELETE 一律 405。 */
-export async function startHttpUpstream(): Promise<HttpUpstream> {
+/** 每个请求新建 Server 与 transport（无状态模式的用法）；GET / DELETE 一律 405。port 缺省为随机空闲端口。 */
+export async function startHttpUpstream(port = 0): Promise<HttpUpstream> {
   const calls: UpstreamCall[] = [];
   let listCount = 0;
 
@@ -61,10 +61,10 @@ export async function startHttpUpstream(): Promise<HttpUpstream> {
       if (!res.headersSent) res.writeHead(500).end();
     });
   });
-  await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
-  const { port } = http.address() as AddressInfo;
+  await new Promise<void>((resolve) => http.listen(port, '127.0.0.1', resolve));
+  const bound = (http.address() as AddressInfo).port;
   return {
-    url: new URL(`http://127.0.0.1:${port}/mcp`),
+    url: new URL(`http://127.0.0.1:${bound}/mcp`),
     calls,
     get listCount() {
       return listCount;
@@ -75,4 +75,13 @@ export async function startHttpUpstream(): Promise<HttpUpstream> {
         http.close(() => resolve());
       }),
   };
+}
+
+/** 取一个当前空闲的本地端口（先监听再关闭），用于「上游稍后才在该端口启动」的场景。 */
+export async function freePort(): Promise<number> {
+  const probe = createServer();
+  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const { port } = probe.address() as AddressInfo;
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  return port;
 }

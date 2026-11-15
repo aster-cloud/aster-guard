@@ -1,5 +1,9 @@
 # 变更记录
 
+## 未发布
+
+- `aster-guard-mcp` 监听模式（`--listen` + `--upstream-url`）：上游启动时不可达不再退出，后台以封顶指数退避（0.5 秒起、30 秒封顶、带抖动）重连；运行中断开同样重连、不重启进程。未就绪时 `/readyz` 为 `503`，`tools/call` 在裁决之前即以 `{ asterGuard: { status: "blocked", reasonCode: "upstream_unavailable" } }` 拒绝，不请求决策、不转发。stdio 子进程上游行为不变。
+
 ## 0.2.0（未发布）
 
 首个发布版本（0.1.0 从未发布）。实现 aster-api ADR 0054（执行点）与 R66 修订。

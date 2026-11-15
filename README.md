@@ -185,7 +185,7 @@ stdio MCP 服务器（ADR 0040 §6；`--listen` 时为 Streamable HTTP，见下�
 
 `--principal-id`、`--principal-type`、`--agent-model` 与每个角色须为 1–255 字符且不含控制字符，否则以参数错误退出（见下文「服务端 Action 限制」）。
 
-上游子进程继承代理的环境变量，但不包含 API key 所在的那个变量。stdout 是 MCP 通道，日志一律写 stderr。退出码：`0` 正常结束（含 `--help`），`1` 上游无法启动、意外断开或对下游的 stdio 通道建立失败（此时先关闭上游子进程），`2` 参数错误。
+上游子进程继承代理的环境变量，但不包含 API key 所在的那个变量。stdout 是 MCP 通道，日志一律写 stderr。退出码：`0` 正常结束（含 `--help`），`1` 上游无法启动、意外断开或对下游的 stdio 通道建立失败（此时先关闭上游子进程），`2` 参数错误。监听模式的 HTTP 上游例外：连不上或断开都不退出，见下节「上游重连」。
 
 要在宿主侧程序里嵌入代理（自行提供 transport 与已连接的上游 `Client`），可从子路径导入：`import { createGuardProxyServer } from '@aster-cloud/aster-guard/mcp'`，选项与 CLI 参数一一对应（`approvalTimeoutMs`、`upstreamTimeoutMs`、`resourceFromArg`、`agentModel`）。
 
@@ -205,12 +205,22 @@ ASTER_GUARD_API_KEY=… aster-guard-mcp --listen 0.0.0.0:8080 \
 | `POST /mcp` | `Authorization: Bearer <token>` 必须匹配登记项，否则 `401 {"error":"unauthorized"}` + `WWW-Authenticate: Bearer`（不建 MCP 服务器、不访问 Guard）；请求体超过 1 MiB → `413`；非 JSON → `400`。通过后为这一个请求新建代理 MCP 服务器与 transport（`enableJsonResponse`），响应结束即关闭 |
 | `GET` / `DELETE /mcp` | `405`（无状态：没有会话与服务端推送流） |
 | `GET /healthz` | `200 ok`（进程存活，用作 liveness） |
-| `GET /readyz` | 最近 30 秒内上游 `tools/list`（3 秒超时）成功过即 `200`，否则 `503`；结论缓存 10 秒，并发请求共享一次探测（用作 readiness） |
+| `GET /readyz` | 最近 30 秒内上游 `tools/list`（3 秒超时）成功过即 `200`，否则 `503`；结论缓存 10 秒，并发请求共享一次探测（用作 readiness）。HTTP 上游未连上或已判定断开时直接 `503`、不探测（见「上游重连」） |
 
 - **Agent 登记**（`--agents-file`）：`{ "agents": [{ "id": "…", "tokenSha256": "<64 位小写十六进制>", "principalId"?: "…", "principalRoles"?: ["…"] }] }`。只存 token 的 sha256，`id` 与 `tokenSha256` 各自唯一，未知键报错。鉴权对每一项做定长比较、不提前返回。每个 Agent 以自己的主体 `{ id: principalId ?? id, type: "agent", roles? }` 裁决，所以监听模式不接受 `--principal-id / --principal-type / --principal-roles`。
 - 上游连接与工具名缓存跨请求共享：连续的 `tools/call` 不会每次都向上游刷新 `tools/list`。
 - `SIGTERM` / `SIGINT`：停止接受新连接，等在途请求结束（至多 5 秒）后关闭上游，以 `0` 退出。
 - 嵌入：`import { startHttpProxy, loadAgents } from '@aster-cloud/aster-guard/mcp'`。
+
+#### 上游重连（`--upstream-url`）
+
+监听模式下 HTTP 上游在启动时连不上**不退出**：代理立即开始服务（`/healthz` `200`、`/readyz` `503`），在后台重试「建立连接 + `tools/list` 验证」，验证通过才算就绪。运行中某次请求遇到连接级失败（`fetch` 失败、上游返回非 2xx、连接被关闭）即判定断开，`/readyz` 立刻转 `503` 并以同样的退避重连，进程不重启。上游的 MCP 协议错误、请求超时与下游取消不算断开。
+
+- **退避**：首次失败后约 0.5 秒，每次翻倍，封顶 30 秒；实际等待取 [上限/2, 上限] 内的随机值（多副本不同步重连）。断开后的第一次重连也先等这一档，不立即重试。缺省值不提供参数修改。
+- **日志**：每次失败一行写 stderr，含底层原因码与下次重试间隔（如 `无法连接上游（fetch failed: ECONNREFUSED），0.4 秒后重试（第 1 次）`）；封顶后即至多每 30 秒一行。连上时记 `上游已连接（第 N 次尝试）`，断开时记 `上游连接中断（…），开始重连`。
+- **未就绪时的 `tools/call`**：在**裁决之前**即拒绝——不向 Guard 请求决策、不 consume、不转发，返回 `isError: true` 与 `{ asterGuard: { status: "blocked", reasonCode: "upstream_unavailable", reason } }`（载荷位置同上文；工具定义尚未缓存时只放 `_meta`）。代理不排队、不延后执行；重试由调用方决定，重试即新决策。`tools/list` 返回 MCP 错误。
+- **就绪后才断开的那一次调用**：若断开发生在裁决与 consume 之后、转发之时，那次调用照常以 `failed` 回写并把错误抛给下游（与「上游超时」同），此后的调用才走上一条。任何情况下都不会不经「决策 → 验签 → consume」就转发。
+- stdio 子进程上游（`--upstream`）不重试：子进程起不来多半是命令或配置写错，仍以 `1` 退出；stdio 模式下上游意外退出也仍以 `1` 退出，由宿主决定是否重启。
 
 ### 客户端配置
 

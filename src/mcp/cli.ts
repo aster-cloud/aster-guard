@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // aster-guard-mcp 可执行入口（ADR 0040 §6）。stdout 是 MCP 通道，所有日志一律写 stderr。
-// 退出码：0 正常结束（含 --help）；1 上游无法连接或意外断开；2 参数错误。
+// 退出码：0 正常结束（含 --help）；1 上游无法连接或意外断开（监听模式的 HTTP 上游除外：后台重连，不退出）；2 参数错误。
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { GuardClient } from '../client.js';
@@ -9,8 +9,9 @@ import type { GuardPrincipal } from '../types.js';
 import { loadAgents, type AgentEntry } from './agents.js';
 import { ConfigError, parseCliArgs, USAGE, wantsHelp, type ProxyConfig } from './config.js';
 import { agentPrincipal, startHttpProxy } from './http-server.js';
-import { createGuardProxyServer, type GuardProxy, type GuardProxyOptions } from './proxy.js';
+import { createGuardProxyServer, type GuardProxy, type GuardProxyOptions, type UpstreamClient } from './proxy.js';
 import { connectUpstream, describeUpstream } from './upstream.js';
+import { superviseUpstream } from './upstream-supervisor.js';
 
 const NAME = 'aster-guard-mcp';
 
@@ -44,6 +45,17 @@ async function main(argv: string[]): Promise<void> {
     process.exitCode = 2;
     return;
   }
+  // 监听模式 + HTTP 上游：不在启动时等上游。立即开始服务（/healthz 200、/readyz 503），后台退避重连；
+  // 未就绪期间 tools/call 在裁决之前即被拒（upstream_unavailable）。stdio 子进程上游的启动失败多为配置错误，仍按原样退出。
+  if (config.listen && agents && config.upstream?.kind === 'http') {
+    const spec = config.upstream;
+    const upstream = superviseUpstream({
+      connect: () => connectUpstream(spec, process.env, config.apiKeyEnv),
+      log: (message) => log(`${describeUpstream(spec)}：${message}`),
+    });
+    await serveHttp(config, config.listen, agents, upstream);
+    return;
+  }
   let upstream: Client | undefined;
   if (config.upstream) {
     try {
@@ -55,6 +67,7 @@ async function main(argv: string[]): Promise<void> {
     }
   }
   if (config.listen && agents && upstream) {
+    upstream.onerror = (e) => log(`上游 MCP 错误：${e.message}`);
     await serveHttp(config, config.listen, agents, upstream);
   } else {
     await serve(config, upstream);
@@ -92,7 +105,7 @@ async function serveHttp(
   config: ProxyConfig,
   listen: NonNullable<ProxyConfig['listen']>,
   agents: readonly AgentEntry[],
-  upstream: Client,
+  upstream: UpstreamClient,
 ): Promise<void> {
   warnIfNoAllowList(config);
   let http;
@@ -118,7 +131,6 @@ async function serveHttp(
       .then(() => upstream.close())
       .catch((e: unknown) => log(`关闭时出错：${errorMessage(e)}`));
   };
-  upstream.onerror = (e) => log(`上游 MCP 错误：${e.message}`);
   process.once('SIGINT', () => shutdown(0));
   process.once('SIGTERM', () => shutdown(0));
   log(

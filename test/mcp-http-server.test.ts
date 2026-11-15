@@ -2,14 +2,15 @@ import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GuardClient } from '../src/client.js';
 import { parseCliArgs } from '../src/mcp/config.js';
 import { startHttpProxy } from '../src/mcp/index.js';
 import { connectUpstream } from '../src/mcp/upstream.js';
+import { superviseUpstream } from '../src/mcp/upstream-supervisor.js';
 import { CONSUME_TICKET_META_KEY } from '../src/tool/consume-ticket.js';
 import { fakeApi } from './fixtures/fake-api.js';
-import { startHttpUpstream } from './fixtures/http-upstream.js';
+import { freePort, startHttpUpstream, type HttpUpstream } from './fixtures/http-upstream.js';
 
 // 无状态 Streamable HTTP 服务端（ADR 0054 §3.1、§12 D4）：真实 HTTP 客户端 → 代理 → HTTP 上游夹具，
 // 决策经假 aster-api。每个请求新建 MCP 服务器与 transport，工具名缓存跨请求共享。
@@ -179,5 +180,120 @@ describe('startHttpProxy', () => {
     });
     expect(() => parseCliArgs([...base, ...http, ...listen, '--principal-id', 'x'], env)).toThrow(/principal 取自 --agents-file/);
     expect(() => parseCliArgs([...base, ...http, ...listen, '--principal-roles', 'x'], env)).toThrow(/principal 取自 --agents-file/);
+  });
+});
+
+/**
+ * 上游重连（#466 阶段 C 生产问题）：监听模式下上游启动时不可达不退出；未就绪时 /readyz 503、
+ * tools/call 在裁决之前即以 upstream_unavailable 拒绝（Guard 无请求、上游无调用）；上游起来 / 恢复后就绪。
+ */
+describe('startHttpProxy：上游重连', () => {
+  async function setupSupervised(upstreamUp: boolean) {
+    const port = await freePort();
+    const holder: { http?: HttpUpstream } = {};
+    if (upstreamUp) holder.http = await startHttpUpstream(port);
+    const url = new URL(`http://127.0.0.1:${port}/mcp`);
+    const logs: string[] = [];
+    const upstream = superviseUpstream({
+      connect: () => connectUpstream({ kind: 'http', url }, {}, 'ASTER_GUARD_API_KEY'),
+      backoff: { initialMs: 20, maxMs: 100 },
+      log: (m) => logs.push(m),
+    });
+    const api = fakeApi();
+    const clock = { t: 1_000_000 };
+    const proxy = await startHttpProxy({
+      listen: { host: '127.0.0.1', port: 0 },
+      agents: AGENTS,
+      upstream,
+      makeProxyOptions: () => ({
+        client: new GuardClient(api.clientOptions()),
+        principal: { id: 'spoofed', type: 'agent' },
+        isolation: ['auth', 'network'],
+      }),
+      now: () => clock.t,
+    });
+    cleanups.push(async () => {
+      await proxy.close();
+      await upstream.close();
+      await holder.http?.close();
+    });
+    const client = new Client({ name: 'agent', version: '0.0.0' });
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL('/mcp', proxy.url), { requestInit: { headers: { Authorization: 'Bearer token-a' } } }),
+    );
+    cleanups.push(() => client.close());
+    const status = (path: string) => fetch(new URL(path, proxy.url)).then((r) => r.status);
+    /** 推进时钟越过 /readyz 缓存，直到就绪状态等于 expected。 */
+    const readyzBecomes = (expected: number) =>
+      vi.waitFor(
+        async () => {
+          clock.t += 11_000;
+          expect(await status('/readyz')).toBe(expected);
+        },
+        { timeout: 5_000, interval: 20 },
+      );
+    const start = async () => {
+      holder.http = await startHttpUpstream(port);
+      return holder.http;
+    };
+    const decisions = () => api.requests.filter((r) => r.path === '/api/v1/guard/decisions').length;
+    return { api, upstream, client, status, readyzBecomes, start, holder, logs, decisions };
+  }
+
+  const guardOf = (result: CallToolResult) => (result._meta as { asterGuard: Record<string, unknown> }).asterGuard;
+
+  it('upstreamDownAtStart：healthz 200、readyz 503，tools/call 被拒且未裁决未转发；上游起来后就绪并放行', async () => {
+    const { api, upstream, client, status, readyzBecomes, start, logs } = await setupSupervised(false);
+
+    expect(await status('/healthz')).toBe(200);
+    expect(await status('/readyz')).toBe(503);
+    expect(upstream.ready()).toBe(false);
+
+    const refused = (await client.callTool({ name: 'echo', arguments: { text: 'early' } })) as CallToolResult;
+    expect(refused.isError).toBe(true);
+    expect(guardOf(refused)).toEqual({
+      status: 'blocked',
+      reasonCode: 'upstream_unavailable',
+      reason: expect.stringContaining('未裁决、未转发'),
+    });
+    // 工具定义未知：载荷只在 _meta，不放 structuredContent。
+    expect(refused.structuredContent).toBeUndefined();
+    await expect(client.listTools()).rejects.toThrow(/upstream_unavailable/);
+    expect(api.requests).toEqual([]);
+
+    const http = await start();
+    await readyzBecomes(200);
+    expect(http.calls).toEqual([]);
+    expect(logs.some((m) => /无法连接上游/.test(m))).toBe(true);
+
+    const allowed = (await client.callTool({ name: 'echo', arguments: { text: 'later' } })) as CallToolResult;
+    expect(allowed.isError).toBeFalsy();
+    expect(http.calls.map((c) => c.arguments)).toEqual([{ text: 'later' }]);
+  });
+
+  it('upstreamDropAndRecover：断开即不就绪、调用被拒不裁决；同址恢复后不重启进程即可放行', async () => {
+    const { client, readyzBecomes, start, holder, decisions, upstream } = await setupSupervised(true);
+    await readyzBecomes(200);
+    const first = (await client.callTool({ name: 'echo', arguments: { text: 'one' } })) as CallToolResult;
+    expect(first.isError).toBeFalsy();
+    expect(decisions()).toBe(1);
+
+    await holder.http!.close();
+    // readyz 的探测撞上断开的上游 → 监督器判定断开 → 立即 503（不等 30 秒窗口）。
+    await readyzBecomes(503);
+    expect(upstream.ready()).toBe(false);
+
+    const refused = (await client.callTool({ name: 'echo', arguments: { text: 'two' } })) as CallToolResult;
+    expect(guardOf(refused)).toMatchObject({ status: 'blocked', reasonCode: 'upstream_unavailable' });
+    // 已知工具（echo 未声明 outputSchema）被拒时照常另放 structuredContent。
+    expect(refused.structuredContent).toEqual({ asterGuard: guardOf(refused) });
+    expect(decisions()).toBe(1);
+
+    const revived = await start();
+    await readyzBecomes(200);
+    const third = (await client.callTool({ name: 'echo', arguments: { text: 'three' } })) as CallToolResult;
+    expect(third.isError).toBeFalsy();
+    expect(revived.calls.map((c) => c.arguments)).toEqual([{ text: 'three' }]);
+    expect(decisions()).toBe(2);
   });
 });
