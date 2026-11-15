@@ -202,9 +202,11 @@ fi
 #   x-access-token:TOKEN），非 bearer——bearer 不被 github.com git 端点接受，会退化成
 #   提示 Username 而在 CI 失败（实测 fatal: could not read Username）。对齐 actions/checkout。
 AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+# 每次调用 clone 到新的临时目录：同一 job 连调两次（mcp 与 demo-tool 各一次），固定 `./k3s` 会让第二次失败。
+K3S_DIR="$(mktemp -d)/k3s"
 git -c "http.https://github.com/.extraheader=${AUTH}" \
-  clone --depth=1 "https://github.com/${K3S_REPO}.git" k3s
-cd k3s
+  clone --depth=1 "https://github.com/${K3S_REPO}.git" "$K3S_DIR"
+cd "$K3S_DIR"
 # 后续所有 remote 操作都带 extraheader，保持 token 不落盘。
 git_c() { git -c "http.https://github.com/.extraheader=${AUTH}" "$@"; }
 
