@@ -128,7 +128,7 @@ const r = await guard.approve(approvalId, { comment: '已核对', inputSnapshotH
 
 ## aster-guard-mcp
 
-stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 MCP 服务器：原样转发 `tools/list`，并拦截每一次 `tools/call`：
+stdio MCP 服务器（ADR 0040 §6；`--listen` 时为 Streamable HTTP，见下节）。指定 `--upstream` 或 `--upstream-url` 时包裹该上游 MCP 服务器：原样转发 `tools/list`，并拦截每一次 `tools/call`：
 
 1. 工具须在白名单内（`--tools` / 配置文件 `tools`；未配置则全部暴露并在启动时告警）；参数先**规范化**：递归按键排序、`null` 原样保留、不删键不改类型。规范化后的对象既是 `action.context` 也是转发给上游的 `arguments`（同一对象）；按工具映射 `digestArgs` 列出的键在 `context` 中以 `{ "$sha256": … }` 代入（转发原值）。
 2. `GuardClient.run` 按固定顺序执行：决策（新 UUID 幂等键；PENDING 等到 `--approval-timeout`）→ 收据验签 → consume → 转发 → 回写（`executed` / `failed`，`resultHash` 为 `content` 的 jcs-sha256/v1）。
@@ -167,7 +167,9 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 | `--base-url <url>` | 必填，aster-api 根地址 |
 | `--policy <module>/<function>` | 必填，裁决所用的策略，如 `guard.customer/decide` |
 | `--principal-id <id>` | 必填，发起主体 id |
-| `--upstream "<cmd> [args…]"` | 上游 MCP 服务器的启动命令，按 shell 规则切分（支持引号）；省略则为治理工具模式 |
+| `--upstream "<cmd> [args…]"` | 上游 MCP 服务器的启动命令，按 shell 规则切分（支持引号）；与 `--upstream-url` 都省略则为治理工具模式 |
+| `--upstream-url <url>` | 上游为 Streamable HTTP MCP 服务器（`http(s)`，如 `http://demo-tool:8080/mcp`）；与 `--upstream` 二选一 |
+| `--upstream-auth-env <name>` | 只配 `--upstream-url`：以该环境变量的值作 `Authorization: Bearer` 发给上游；不能与 API key 变量同名，未设置或为空即参数错误；值不写进日志与错误信息 |
 | `--api-key-env <name>` | 存放 API key 的环境变量名，默认 `ASTER_GUARD_API_KEY`；API key 只从环境变量读取 |
 | `--principal-type <type>` | 默认 `agent` |
 | `--principal-roles <a,b>` | 逗号分隔，至多 16 项 |
@@ -176,7 +178,7 @@ stdio MCP 服务器（ADR 0040 §6）。指定 `--upstream` 时包裹该上游 M
 | `--resource-from <argName>` | 以该工具参数的值作为 `resource.id`；过长或含控制字符时改用 `sha256:<hex>` |
 | `--agent-model <model>` | 写入 `action.agent.model` |
 | `--tenant-id <id>` | 代理模式必填：API key 所属租户，收据 `payload.tenantId` 须与之相等 |
-| `--isolation network\|auth` | 代理模式必填（配置自述，由部署层绕过测试验证）：`network` = 上游只接受代理的连接（stdio 子进程天然满足）；`auth` = 转发时在 `params._meta["io.aster/guard-consume"]` 附 consume 票据，工具侧用 `@aster-cloud/aster-guard/tool` 核对 |
+| `--isolation <list>` | 代理模式必填，逗号分隔、去重（配置自述，由部署层绕过测试验证；ADR 0054 §12 D1）：`network` = 上游只接受代理的连接（stdio 子进程天然满足；HTTP 上游由部署层网络策略保证，代理本身不做任何事）；`auth` = 转发时在 `params._meta["io.aster/guard-consume"]` 附 consume 票据，工具侧用 `@aster-cloud/aster-guard/tool` 核对；`network,auth` = 两层同时声明，任一层单独失效时另一层仍挡住直连。0.2.0 的单值写法照常可用 |
 | `--tools <a,b>` | 工具白名单（覆盖配置文件 `tools`） |
 | `--config <file.json>` | `{ "tools": [...], "actions": { "<tool>": { "resourceFrom", "digestArgs", "actionName" } } }`，未知键报错，`actions` 中的工具须在白名单内 |
 | `--executor-id <id>` | 对账用执行方标识，默认 `aster-guard-mcp@<hostname>` |

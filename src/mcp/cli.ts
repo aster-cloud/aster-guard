@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // aster-guard-mcp 可执行入口（ADR 0040 §6）。stdout 是 MCP 通道，所有日志一律写 stderr。
 // 退出码：0 正常结束（含 --help）；1 上游无法连接或意外断开；2 参数错误。
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { GuardClient } from '../client.js';
 import { VERSION } from '../index.js';
-import { ConfigError, parseCliArgs, upstreamEnv, USAGE, wantsHelp, type ProxyConfig } from './config.js';
+import { ConfigError, parseCliArgs, USAGE, wantsHelp, type ProxyConfig } from './config.js';
 import { createGuardProxyServer, type GuardProxy } from './proxy.js';
+import { connectUpstream, describeUpstream } from './upstream.js';
 
 const NAME = 'aster-guard-mcp';
 
@@ -42,25 +42,14 @@ async function main(argv: string[]): Promise<void> {
   let upstream: Client | undefined;
   if (config.upstream) {
     try {
-      upstream = await connectUpstream(config.upstream, config.apiKeyEnv);
+      upstream = await connectUpstream(config.upstream, process.env, config.apiKeyEnv);
     } catch (e) {
-      log(`无法连接上游 MCP 服务器（${config.upstream.command}）：${errorMessage(e)}`);
+      log(`无法连接上游 MCP 服务器（${describeUpstream(config.upstream)}）：${errorMessage(e)}`);
       process.exitCode = 1;
       return;
     }
   }
   await serve(config, upstream);
-}
-
-/** 启动上游子进程并完成 MCP 初始化；失败时 SDK 会关闭 transport（结束子进程）后抛出。 */
-async function connectUpstream(
-  { command, args }: NonNullable<ProxyConfig['upstream']>,
-  apiKeyEnv: string,
-): Promise<Client> {
-  const client = new Client({ name: NAME, version: VERSION });
-  // 上游的 stderr 继承本进程 stderr；stdout 由 transport 接管为 MCP 通道。
-  await client.connect(new StdioClientTransport({ command, args, env: upstreamEnv(process.env, apiKeyEnv) }));
-  return client;
 }
 
 /**
@@ -96,9 +85,9 @@ async function serve(config: ProxyConfig, upstream: Client | undefined): Promise
   }
   watchLifecycle(proxy, upstream);
   log(
-    upstream
-      ? `${VERSION} 代理模式已启动，上游：${config.upstream?.command}`
-      : `${VERSION} 治理工具模式已启动（未指定 --upstream）`,
+    config.upstream
+      ? `${VERSION} 代理模式已启动，上游：${describeUpstream(config.upstream)}`
+      : `${VERSION} 治理工具模式已启动（未指定上游）`,
   );
 }
 

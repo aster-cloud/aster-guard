@@ -49,6 +49,9 @@ export type GuardClientLike = Pick<
 /** 代理用到的上游 Client 方法；代理接管其生命周期，close() 时一并关闭。 */
 export type UpstreamClient = Pick<Client, 'listTools' | 'callTool' | 'close'>;
 
+/** 原始工具端点的隔离方式（ADR 0054 §3.1–§3.3、§12 D1）。 */
+export type Isolation = 'network' | 'auth';
+
 export interface GuardProxyOptions {
   client: GuardClientLike;
   /** 被包裹的上游 MCP 服务器（已连接）；缺省为治理工具模式。 */
@@ -68,8 +71,8 @@ export interface GuardProxyOptions {
   agentModel?: string;
   /** 对账用执行方标识；缺省由 GuardClient.run 取 `aster-guard-sdk@<hostname>`，CLI 传 `aster-guard-mcp@<hostname>`。 */
   executorId?: string;
-  /** 隔离方式；`auth` 时转发请求附 consume 票据。 */
-  isolation?: 'network' | 'auth';
+  /** 隔离方式（单值或列表）；含 `auth` 时转发请求附 consume 票据。 */
+  isolation?: Isolation | readonly Isolation[];
   /** 工具白名单；缺省全部上游工具。 */
   tools?: string[];
   /** 按工具的 action 映射。 */
@@ -165,7 +168,7 @@ function installGuardedUpstream(server: Server, upstream: UpstreamClient, option
         {
           name,
           arguments: args,
-          ...(options.isolation === 'auth'
+          ...(isolations(options).includes('auth')
             ? { _meta: { [CONSUME_TICKET_META_KEY]: { decisionId: grant.decisionId, attemptId: grant.attemptId, envelope: envelopeOf(action) } } }
             : {}),
         },
@@ -205,6 +208,13 @@ function installGuardedUpstream(server: Server, upstream: UpstreamClient, option
         throw outcome.error;
     }
   });
+}
+
+/** 把单值或列表形式的 isolation 统一为列表。 */
+function isolations(options: GuardProxyOptions): readonly Isolation[] {
+  const { isolation } = options;
+  if (isolation === undefined) return [];
+  return typeof isolation === 'string' ? [isolation] : isolation;
 }
 
 /** 上游结果归类：isError → failed；resultHash 为 content 的 jcs-sha256/v1（无法规范化时省略）。 */

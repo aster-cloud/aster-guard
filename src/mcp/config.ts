@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import type { GuardPrincipal } from '../types.js';
 import type { ActionMapping } from './action-mapping.js';
+import type { Isolation } from './proxy.js';
 import { hasControlChar, MAX_ROLES, MAX_TEXT_LENGTH } from './action-limits.js';
 
 /** 缺省的 API key 环境变量名。API key 只从环境变量读取，不接受命令行传入（argv 对同机其他进程可见）。 */
@@ -21,9 +22,9 @@ const MAX_UPSTREAM_TIMEOUT_SECONDS = 2_147_483;
 
 export const USAGE = `用法：aster-guard-mcp --base-url <url> --policy <module>/<function> --principal-id <id> [选项]
 
-stdio MCP 服务器。指定 --upstream 时包裹该上游 MCP 服务器：原样转发 tools/list，
+stdio MCP 服务器。指定 --upstream 或 --upstream-url 时包裹该上游 MCP 服务器：原样转发 tools/list，
 每一次 tools/call 先经 Aster Action Guard 裁决，ALLOW 才转发，DENY 返回工具错误，
-PENDING 等待人工审批后再按结论处理（ADR 0040 §6）。不指定 --upstream 时只提供
+PENDING 等待人工审批后再按结论处理（ADR 0040 §6）。不指定上游时只提供
 guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject 五个治理工具。
 
 必填：
@@ -33,6 +34,10 @@ guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject
 
 选项：
   --upstream "<cmd> [args…]"    上游 MCP 服务器的启动命令，按 shell 规则切分（支持引号与反斜杠转义）
+  --upstream-url <url>          上游为 Streamable HTTP MCP 服务器（http(s) URL，如 http://tool:8080/mcp）；
+                                与 --upstream 二选一
+  --upstream-auth-env <name>    连接 --upstream-url 时以该环境变量的值作 Authorization: Bearer；
+                                须与 API key 变量不同，值不会写进日志或错误信息
   --api-key-env <name>          存放 API key 的环境变量名，缺省 ${DEFAULT_API_KEY_ENV}；
                                 API key 只从环境变量读取，且不会传给上游进程
   --principal-type <type>       主体类型，缺省 agent
@@ -45,12 +50,16 @@ guard_check / guard_status / guard_list_approvals / guard_approve / guard_reject
                                 超过 ${MAX_TEXT_LENGTH} 字符或含控制字符时改用 sha256:<hex>
   --agent-model <model>         写入 action.agent.model 的模型名
 
-执行点（有 --upstream 时；ADR 0054 §2–§3，R66）：
+执行点（有上游时；ADR 0054 §2–§3，R66）：
   --tenant-id <id>              API key 所属租户（必填）：执行收据的 payload.tenantId 须与之相等
-  --isolation network|auth      原始工具端点的隔离方式（必填，配置自述，由部署层绕过测试验证）：
-                                network = 上游只接受来自代理的连接（stdio 子进程天然满足）；
+  --isolation <list>            原始工具端点的隔离方式（必填，逗号分隔，取值 network、auth；配置自述，
+                                由部署层绕过测试验证，ADR 0054 §12 D1）：
+                                network = 上游只接受来自代理的连接（stdio 子进程天然满足；HTTP 上游由
+                                          部署层网络策略保证，代理本身不做任何事）；
                                 auth    = 转发时在 params._meta["io.aster/guard-consume"] 附 consume 票据，
-                                          上游工具用 @aster-cloud/aster-guard/tool 的 verifyConsumeTicket 核对
+                                          上游工具用 @aster-cloud/aster-guard/tool 的 verifyConsumeTicket 核对；
+                                network,auth = 两层同时声明：网络策略挡直连，即使网络层失效，
+                                          工具侧票据核对仍拒绝无票据 / 伪造票据的调用
   --tools <a,b>                 工具白名单：只有列出的上游工具出现在 tools/list 且可调用（覆盖配置文件 tools）；
                                 未配置则全部暴露并在启动时告警
   --config <file.json>          配置文件 { "tools": [...], "actions": { "<tool>": { "resourceFrom", "digestArgs", "actionName" } } }；
@@ -72,10 +81,15 @@ export class ConfigError extends Error {
   }
 }
 
+/** 上游 MCP 服务器：stdio 子进程（命令 + 参数）或 Streamable HTTP（URL + 可选的 Bearer 变量名）。 */
+export type UpstreamSpec =
+  | { kind: 'stdio'; command: string; args: string[] }
+  | { kind: 'http'; url: URL; authEnv?: string };
+
 /** 解析后的代理配置。 */
 export interface ProxyConfig {
-  /** 上游 MCP 服务器的启动命令；缺省表示治理工具模式。 */
-  upstream?: { command: string; args: string[] };
+  /** 上游 MCP 服务器：stdio 子进程或 Streamable HTTP；缺省表示治理工具模式。 */
+  upstream?: UpstreamSpec;
   baseUrl: string;
   /** API key 所在的环境变量名（构造上游环境时要剔除它）。 */
   apiKeyEnv: string;
@@ -91,8 +105,8 @@ export interface ProxyConfig {
   tenantId?: string;
   /** 对账用执行方标识（ADR 0054 §5）。 */
   executorId: string;
-  /** 有上游时必填：隔离方式自述。 */
-  isolation?: 'network' | 'auth';
+  /** 有上游时必填：隔离方式自述（去重、按字母序）。 */
+  isolation?: readonly Isolation[];
   /** 工具白名单；缺省全部暴露。 */
   tools?: string[];
   /** 按工具的 action 映射。 */
@@ -101,6 +115,8 @@ export interface ProxyConfig {
 
 const OPTIONS = {
   upstream: { type: 'string' },
+  'upstream-url': { type: 'string' },
+  'upstream-auth-env': { type: 'string' },
   'base-url': { type: 'string' },
   'api-key-env': { type: 'string' },
   policy: { type: 'string' },
@@ -153,8 +169,28 @@ const rolesList = z
       .max(MAX_ROLES, `--principal-roles 不能超过 ${MAX_ROLES} 项`),
   );
 
+/** 逗号分隔的隔离方式：去空白与空项，至少一项，去重后按字母序。 */
+const isolationList = z
+  .string()
+  .transform((value) =>
+    value
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => item !== ''),
+  )
+  .pipe(
+    z
+      .array(z.enum(['network', 'auth'], { error: '--isolation 的每一项须为 network 或 auth' }))
+      .min(1, '--isolation 不能为空（network、auth 或 network,auth）'),
+  )
+  .transform((items) => [...new Set(items)].sort() as Isolation[]);
+
 const CliSchema = z.object({
   upstream: z.string().optional(),
+  'upstream-url': z
+    .url({ protocol: /^https?$/, error: '--upstream-url 须为 http(s) URL' })
+    .optional(),
+  'upstream-auth-env': optionalText('upstream-auth-env'),
   'base-url': z.url({
     protocol: /^https?$/,
     error: (issue) => (issue.input === undefined ? '缺少必填参数 --base-url' : '--base-url 须为 http(s) URL'),
@@ -189,7 +225,7 @@ const CliSchema = z.object({
     .max(255, '--executor-id 不能超过 255 个字符')
     .refine((value) => !hasControlChar(value), '--executor-id 不能含控制字符')
     .optional(),
-  isolation: z.enum(['network', 'auth'], { error: '--isolation 须为 network 或 auth' }).optional(),
+  isolation: isolationList.optional(),
   tools: z
     .string()
     .transform((value) => value.split(',').map((t) => t.trim()).filter((t) => t !== ''))
@@ -239,10 +275,11 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
     throw new ConfigError(`环境变量 ${apiKeyEnv} 未设置 API key`);
   }
   const [policyModule, policyFunction] = options.policy.split('/');
-  const execution = executionConfig(options);
+  const upstream = upstreamSpec(options, env, apiKeyEnv);
+  const execution = executionConfig(options, upstream !== undefined);
   const roles = options['principal-roles'];
   return {
-    ...(options.upstream === undefined ? {} : { upstream: parseUpstream(options.upstream) }),
+    ...(upstream === undefined ? {} : { upstream }),
     baseUrl: options['base-url'],
     apiKeyEnv,
     apiKey,
@@ -263,18 +300,47 @@ export function parseCliArgs(argv: readonly string[], env: NodeJS.ProcessEnv): P
 
 type CliOptions = z.infer<typeof CliSchema>;
 
+/**
+ * 上游：--upstream（stdio）与 --upstream-url（HTTP）二选一；--upstream-auth-env 只配 --upstream-url，
+ * 不能与 API key 变量同名（否则 Guard 凭据会发给被守护的工具），变量须已设置且非空。错误信息只写变量名。
+ */
+function upstreamSpec(options: CliOptions, env: NodeJS.ProcessEnv, apiKeyEnv: string): UpstreamSpec | undefined {
+  const url = options['upstream-url'];
+  const authEnv = options['upstream-auth-env'];
+  if (options.upstream !== undefined && url !== undefined) {
+    throw new ConfigError('--upstream 与 --upstream-url 不能同时指定');
+  }
+  if (authEnv !== undefined && url === undefined) {
+    throw new ConfigError('--upstream-auth-env 只用于 --upstream-url');
+  }
+  if (url === undefined) {
+    return options.upstream === undefined ? undefined : parseUpstream(options.upstream);
+  }
+  if (authEnv === undefined) return { kind: 'http', url: new URL(url) };
+  if (authEnv === apiKeyEnv) {
+    throw new ConfigError(`--upstream-auth-env 不能与 API key 变量（${apiKeyEnv}）相同：Guard 凭据不得发给上游`);
+  }
+  if (!env[authEnv]?.trim()) {
+    throw new ConfigError(`环境变量 ${authEnv}（--upstream-auth-env）未设置或为空`);
+  }
+  return { kind: 'http', url: new URL(url), authEnv };
+}
+
 /** 执行点相关配置：只在有上游时允许；有上游时 --tenant-id 与 --isolation 必填。 */
-function executionConfig(options: CliOptions): Pick<ProxyConfig, 'tenantId' | 'executorId' | 'isolation' | 'tools' | 'actions'> {
+function executionConfig(
+  options: CliOptions,
+  hasUpstream: boolean,
+): Pick<ProxyConfig, 'tenantId' | 'executorId' | 'isolation' | 'tools' | 'actions'> {
   const executorId = options['executor-id'] ?? `aster-guard-mcp@${hostname()}`;
-  if (options.upstream === undefined) {
+  if (!hasUpstream) {
     const misplaced = (['tenant-id', 'isolation', 'tools', 'config'] as const).filter((k) => options[k] !== undefined);
     if (misplaced.length > 0) {
-      throw new ConfigError(`${misplaced.map((k) => `--${k}`).join(' / ')} 只用于代理模式（需同时指定 --upstream）`);
+      throw new ConfigError(`${misplaced.map((k) => `--${k}`).join(' / ')} 只用于代理模式（需同时指定 --upstream 或 --upstream-url）`);
     }
     return { executorId, actions: {} };
   }
   if (options['tenant-id'] === undefined) throw new ConfigError('代理模式缺少必填参数 --tenant-id');
-  if (options.isolation === undefined) throw new ConfigError('代理模式缺少必填参数 --isolation（network 或 auth）');
+  if (options.isolation === undefined) throw new ConfigError('代理模式缺少必填参数 --isolation（network、auth 或 network,auth）');
   const file = options.config === undefined ? {} : readConfigFile(options.config);
   const tools = options.tools ?? file.tools;
   const actions = file.actions ?? {};
@@ -310,12 +376,12 @@ function readOptions(argv: readonly string[]) {
   }
 }
 
-function parseUpstream(commandLine: string): { command: string; args: string[] } {
+function parseUpstream(commandLine: string): UpstreamSpec {
   const [command, ...args] = splitShellWords(commandLine);
   if (command === undefined || command === '') {
     throw new ConfigError('--upstream 不能为空');
   }
-  return { command, args };
+  return { kind: 'stdio', command, args };
 }
 
 /**
