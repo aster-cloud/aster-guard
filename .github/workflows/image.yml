@@ -168,7 +168,8 @@ jobs:
   # 新鲜度：本 job 的 Final stale gate 只是减少噪音；真正的闸在 k3s——verify-image-pin 规则 3（freshness
   # latest-only）对每次 head 要求 sourceSha == 本仓 main 当前 HEAD，否则拒绝；合并用 --match-head-commit
   # 锁定已验证的 head。main 前进后更新的运行会强推同一固定分支，旧 digest 的 head 随之作废。
-  # 剩余窗口（验证通过后、合并前 main 恰好前进）与所有源仓共用同一脚本，修正应在上游统一做。
+  # 剩余窗口（验证通过后、合并前 main 恰好前进）与所有源仓共用同一脚本，修正应在上游统一做；
+  # 其后果是集群短暂运行「同样来自 main、同样签名」的上一个 digest，直到更新的 run 再次 pin（最终一致）。
   # 前置（用户，U-G2）：Environment image-pin（部署分支仅 main）内 vars.IMAGE_PIN_APP_CLIENT_ID 与
   # secrets.IMAGE_PIN_APP_PRIVATE_KEY。k3s 侧尚无对应 lock / 信任根时 verify-image-pin 拒绝、本 job 红（预期）。
   image-pin-pr:
@@ -178,7 +179,8 @@ jobs:
     environment: image-pin
     outputs:
       pinned: ${{ steps.openpr-mcp.outcome == 'success' && steps.openpr-tool.outcome == 'success' }}
-      final_stale: ${{ steps.stalegate.outputs.skip }}
+      # 任一 stale gate 判定过时即 true（pin-closure-guard 据此把「未 pin」判为按设计跳过）。
+      final_stale: ${{ steps.stalegate.outputs.skip == 'true' || steps.stalegate2.outputs.skip == 'true' }}
     concurrency:
       group: image-pin-pr-aster-guard
       cancel-in-progress: true
@@ -225,9 +227,23 @@ jobs:
           KUSTOMIZATION_PATH: apps/aster-lang/guard/kustomization.yaml
         run: bash scripts/ci/open-image-pin-pr.sh docker.io/wontlost/aster-guard-mcp image-pin/aster-guard-mcp
 
+      # 第一个 pin 会等 k3s verify-image-pin 后才合并（可达数分钟）；开第二个 pin 前再核对一次，缩小过时窗口。
+      - name: Stale gate before second pin
+        id: stalegate2
+        if: ${{ steps.stalegate.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tip="$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)"
+          if [ "${GITHUB_SHA}" != "${tip}" ]; then
+            echo "::notice::main 已前进（${tip}），跳过 aster-guard-demo-tool 的 pin，由更新的 run 接手"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Open/update image-pin PR (aster-guard-demo-tool)
         id: openpr-tool
-        if: ${{ steps.stalegate.outputs.skip != 'true' }}
+        if: ${{ steps.stalegate.outputs.skip != 'true' && steps.stalegate2.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ steps.k3stoken.outputs.token }}
           DIGEST: ${{ needs.build.outputs.tool_digest }}

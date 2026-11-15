@@ -68,6 +68,12 @@ describe('image.yml', () => {
     ]);
     expect(opens[0].run).toContain(`${IMAGES[0]} image-pin/aster-guard-mcp`);
     expect(opens[1].run).toContain(`${IMAGES[1]} image-pin/aster-guard-demo-tool`);
+    // 第二个 pin 之前再核对一次 main tip；任一 gate 判定过时都要传给 pin-closure-guard。
+    const names = pin.steps.map((s) => s.id);
+    expect(names.indexOf('stalegate2')).toBeGreaterThan(names.indexOf('openpr-mcp'));
+    expect(names.indexOf('stalegate2')).toBeLessThan(names.indexOf('openpr-tool'));
+    expect(opens[1].if).toContain("steps.stalegate2.outputs.skip != 'true'");
+    expect((pin as Job & { outputs: Record<string, string> }).outputs.final_stale).toContain('stalegate2');
     const guard = workflow.jobs['pin-closure-guard'];
     expect(guard.if).toBe('always()');
     expect(guard.steps.some((s) => s.run === 'bash scripts/ci/pin-closure-guard.sh')).toBe(true);
