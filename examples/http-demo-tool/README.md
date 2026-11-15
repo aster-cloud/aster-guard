@@ -33,5 +33,5 @@ aster-api ADR 0054 §12 D6 的受保护工具：部署在 k3s `aster-tools` 命�
 
 ```bash
 pnpm vitest run examples/http-demo-tool   # 测试（根目录执行）
-pnpm -r build                             # 构建根包与本示例（dist/server.js 为容器入口）
+pnpm run build && pnpm -r build           # 构建根包与本示例（-r 不含根包；dist/server.js 为容器入口）
 ```

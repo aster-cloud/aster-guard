@@ -1,0 +1,13 @@
+# 镜像构建上下文只需要源码与锁文件；构建产物与本地状态一律排除。
+**/node_modules
+**/dist
+coverage
+.git
+.github
+.claude
+.idea
+.vscode
+*.log
+*.tgz
+test
+examples/*/test

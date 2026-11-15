@@ -48,6 +48,9 @@ jobs:
       - name: Build
         run: pnpm run build
 
+      - name: Pin closure guard self-test
+        run: bash scripts/ci/pin-closure-guard.test.sh
+
   # CI 通过后才发布到 npm：组织级 NPM_TOKEN + provenance（aster-api ADR 0054 §11 D6；仓库公开，OIDC 产出 provenance 证明）
   publish:
     needs: ci
