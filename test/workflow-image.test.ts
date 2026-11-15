@@ -79,6 +79,20 @@ describe('image.yml', () => {
     expect(guard.steps.some((s) => s.run === 'bash scripts/ci/pin-closure-guard.sh')).toBe(true);
   });
 
+  it('pinScriptClonesIntoFreshDirEachCall', () => {
+    // 同一 job 里连调两次：固定 `./k3s` 会让第二次 clone 失败（fatal: destination path 'k3s' already exists）。
+    const script = read('scripts/ci/open-image-pin-pr.sh');
+    const clone = script.split('\n').find((l) => /clone --depth=1/.test(l)) ?? '';
+    expect(clone).not.toMatch(/\.git" k3s\s*$/);
+    expect(script).toMatch(/K3S_DIR="\$\(mktemp -d\)\/k3s"/);
+    expect(script).toMatch(/cd "\$K3S_DIR"/);
+  });
+
+  it('pinClosureGuardRuns', () => {
+    const guard = workflow.jobs['pin-closure-guard'];
+    expect(guard.steps.some((s) => s.run === 'bash scripts/ci/pin-closure-guard.sh')).toBe(true);
+  });
+
   it('bothImagesAreArchVerifiedBeforeSigning', () => {
     const steps = workflow.jobs.build.steps;
     const index = (pred: (s: Step) => boolean, label: string) => {
