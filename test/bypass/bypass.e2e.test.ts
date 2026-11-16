@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { GuardClient } from '../../src/client.js';
+import { hashAction } from '../../src/hash/jcs.js';
 import { buildToolAction, canonicalArgs, envelopeOf } from '../../src/mcp/action-mapping.js';
 import { MemoryAttemptLedger, verifyConsumeTicket, type TicketRejection } from '../../src/tool/index.js';
+import type { ExecutionReceiptPayload } from '../../src/types.js';
 import { fakeApi } from '../fixtures/fake-api.js';
 import { E2E, env, guardClient, guardMeta, proxyRig, receiptsOf, SKIP_REASON } from './harness.js';
 
@@ -215,6 +217,112 @@ e2e('绕过夹具套件（本地 aster-api）', { timeout: 30_000 }, () => {
       expect(outcome.kind).toBe('executed');
       expect(verdict).toEqual({ ok: false, reason: 'policy_mismatch' });
     });
+  });
+});
+
+e2e('#8 B8 换策略模块另取 ALLOW 收据（#517，ADR 0040 §13 R68；本地 aster-api）', { timeout: 30_000 }, () => {
+  const action = { action: { name: 'refund_payment' }, resource: { type: 'payment', id: 'P-B8' }, context: { amount: 250000 } };
+
+  /** 执行方期望的严格策略 DENY；同一动作换到同租户宽松模块 ALLOW，actionHash 相同，签名覆盖的是宽松模块的地址。 */
+  async function switchedAllow() {
+    const strict = await guardClient().check(action);
+    expect(strict.effectiveOutcome).toBe('DENY');
+    expect(strict.executionReceipt).toBeUndefined();
+    const switched = await guardClient({ policy: env.lenientPolicy }).check(action);
+    expect(switched.effectiveOutcome).toBe('ALLOW');
+    const [module, fn] = env.lenientPolicy!.split('/');
+    expect(switched.executionReceipt?.payload).toMatchObject({ policyModule: module, policyFunction: fn, v: 1 });
+    return switched;
+  }
+
+  const expectOf = (d: Awaited<ReturnType<typeof switchedAllow>>) => ({
+    decisionId: d.decisionId,
+    actionHash: hashAction({ ...action, principal: { id: 'bypass-agent', type: 'agent' } }),
+    policyVersionId: d.policyVersion?.id,
+  });
+
+  it.skipIf(!env.lenientPolicy)('换模块的收据被期望严格策略的执行方本地拒绝 policy_mismatch，未 consume', async () => {
+    const switched = await switchedAllow();
+    expect(switched.executionReceipt?.payload.actionHash).toBe(expectOf(switched).actionHash);
+    expect(await guardClient().verifyReceipt(switched.executionReceipt, expectOf(switched))).toEqual({
+      ok: false,
+      reasonCode: 'receipt_invalid',
+      detail: 'policy_mismatch',
+    });
+    expect(await consumedBy(switched.decisionId)).toBeUndefined();
+  });
+
+  it.skipIf(!env.lenientPolicy)('把签名载荷的地址改写成期望模块 → bad_signature，未 consume', async () => {
+    const switched = await switchedAllow();
+    const [module] = env.policy.split('/');
+    const receipt = switched.executionReceipt!;
+    const forged = { ...receipt, payload: { ...receipt.payload, policyModule: module } };
+    expect(await guardClient().verifyReceipt(forged, expectOf(switched))).toEqual({
+      ok: false,
+      reasonCode: 'receipt_invalid',
+      detail: 'bad_signature',
+    });
+    expect(await consumedBy(switched.decisionId)).toBeUndefined();
+  });
+});
+
+describe('#8 B8 换策略模块另取 ALLOW 收据（#517，mock /decisions，始终启用）', () => {
+  // 假 API 按请求体的 policyModule 签地址：严格模块 DENY、宽松模块 ALLOW。决策请求在线上被改投到宽松模块
+  // （直连调用方 / 被篡改的网关），执行方拿到签名有效、actionHash 相同的 ALLOW——只有核对签名覆盖的地址才能拒绝。
+  const STRICT = 'guard.strict';
+  const LENIENT = 'guard.lenient';
+  const INPUT_B8 = { action: { name: 'refund_payment' }, resource: { type: 'payment', id: 'P-B8' }, context: { amount: 250000 } };
+
+  function rig(rewrite?: (p: ExecutionReceiptPayload) => ExecutionReceiptPayload) {
+    const api = fakeApi();
+    api.override((req) => {
+      if (req.method !== 'POST' || req.path !== '/api/v1/guard/decisions') return undefined;
+      const body = req.body as { policyModule: string };
+      api.script(body.policyModule === STRICT ? 'DENY' : 'ALLOW');
+      return undefined;
+    });
+    if (rewrite) api.mutateReceipts((r) => ({ ...r, payload: rewrite(r.payload) }));
+    const switchModule: typeof fetch = (input, init) => {
+      if (String(input).endsWith('/api/v1/guard/decisions') && typeof init?.body === 'string') {
+        const body = JSON.parse(init.body) as Record<string, unknown>;
+        return api.fetch(input, { ...init, body: JSON.stringify({ ...body, policyModule: LENIENT }) });
+      }
+      return api.fetch(input, init);
+    };
+    const sideEffects: string[] = [];
+    const execute = async (grant: { attemptId: string }) => void sideEffects.push(grant.attemptId);
+    const strictExecutor = new GuardClient(api.clientOptions({ policyModule: STRICT, fetch: switchModule }));
+    return { api, sideEffects, execute, strictExecutor };
+  }
+
+  it('换模块取得的 ALLOW：执行方 policy_mismatch，不 consume、无副作用', async () => {
+    const { api, sideEffects, execute, strictExecutor } = rig();
+    const outcome = await strictExecutor.run(INPUT_B8, execute, { executorId: 'x@y' });
+    expect(api.decisions.values().next().value?.response.executionReceipt?.payload.policyModule).toBe(LENIENT);
+    expect(outcome).toMatchObject({ kind: 'blocked', decision: { reasonCode: 'receipt_invalid', reason: expect.stringContaining('policy_mismatch') } });
+    expect(api.sequence().some((s) => s.includes('consume'))).toBe(false);
+    expect(sideEffects).toEqual([]);
+  });
+
+  it('把载荷地址改写成期望模块 → bad_signature，不 consume、无副作用', async () => {
+    const { api, sideEffects, execute, strictExecutor } = rig((p) => ({ ...p, policyModule: STRICT }));
+    const outcome = await strictExecutor.run(INPUT_B8, execute, { executorId: 'x@y' });
+    expect(outcome).toMatchObject({ kind: 'blocked', decision: { reasonCode: 'receipt_invalid', reason: expect.stringContaining('bad_signature') } });
+    expect(api.sequence().some((s) => s.includes('consume'))).toBe(false);
+    expect(sideEffects).toEqual([]);
+  });
+
+  it('正向对照：出自期望模块的收据照常执行恰一次', async () => {
+    const api = fakeApi();
+    const sideEffects: string[] = [];
+    const outcome = await new GuardClient(api.clientOptions({ policyModule: LENIENT })).run(
+      INPUT_B8,
+      async (grant) => void sideEffects.push(grant.attemptId),
+      { executorId: 'x@y' },
+    );
+    expect(outcome.kind).toBe('executed');
+    expect(sideEffects).toHaveLength(1);
+    expect(api.sequence().filter((s) => s.endsWith('/consume'))).toHaveLength(1);
   });
 });
 

@@ -49,7 +49,7 @@ const outcome = await guard.run(
 // outcome.kind: 'executed' | 'blocked' | 'pending' | 'failed'
 ```
 
-`run` 的顺序固定，任一步失败即返回、回调不被调用：`hashAction(action)`（jcs-sha256/v1，与请求体是同一个对象）→ `POST /decisions`（PENDING 则等待审批）→ 执行收据验签（JWKS 缓存 300 s；`payload.tenantId / decisionId / outcome / 时间窗 / actionHash`，以及 `payload.policyVersionId` 必须等于同一响应的 `policyVersion.id`——收据的 `actionHash` 不含策略模块，见 ADR 0054 §11 D12）→ consume（consume 时按当前对象**重算**哈希，决策后被改动的动作得到 409 `action_mismatch`）→ 回调 → 结果回写。没有任何跳过验签或 consume 的选项；只有本次请求的决策 consume 成功才是授权，别处读到的 ALLOW 或收据都不是（§11.4）。
+`run` 的顺序固定，任一步失败即返回、回调不被调用：`hashAction(action)`（jcs-sha256/v1，与请求体是同一个对象）→ `POST /decisions`（PENDING 则等待审批）→ 执行收据验签（JWKS 缓存 300 s；`payload.tenantId / decisionId / outcome / 时间窗 / actionHash`；签名覆盖的 `payload.policyModule / policyFunction` 必须**存在**且等于本客户端配置的 `policyModule / policyFunction`（aster-api ADR 0040 §13 R68）；`payload.policyVersionId` 必须等于同一响应的 `policyVersion.id`（ADR 0054 §11 D12）。收据的 `actionHash` 不含策略地址，同租户换一个宽松模块会得到同一 actionHash 的 ALLOW，所以地址缺失或不符一律 `receipt_invalid`（`policy_mismatch`），见下文「服务端版本要求与回滚」）→ consume（consume 时按当前对象**重算**哈希，决策后被改动的动作得到 409 `action_mismatch`）→ 回调 → 结果回写。没有任何跳过验签或 consume 的选项；只有本次请求的决策 consume 成功才是授权，别处读到的 ALLOW 或收据都不是（§11.4）。
 
 - `executorId` 缺省 `aster-guard-sdk@<hostname>`（#465 对账的执行方标签）；须 ≤ 255 字符、无控制字符。
 - consume 响应丢失（超时 / 断网 / 5xx）：不执行，尽力回写 `aborted / consume_response_lost`，返回 `blocked client_timeout|client_error`。
@@ -311,13 +311,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 ```
 
+工具侧不对回读的 `executionReceipt` 做离线验签。工具的信任边界是「用自己的 key 经鉴权向 aster-api 回读决策」：放行所依据的 `actionHash`、`consumedBy`、`result` 都只来自这次回读、本就不在签名内，所以对地址验签虽能把地址绑定到收据，却不改变工具放行的信任根——能伪造回读响应的一方同样能伪造 consume 状态；它还要在工具侧引入 JWKS 拉取，且收据时间窗（5 分钟）可能在 consume 之后、工具核对之前到期。签名覆盖的地址由执行方（SDK `run` / 代理）在 consume **之前**核对；工具侧核对回读的 `policyModule / policyFunction`（R66 D12），二者合起来覆盖 #517。
+
 核对顺序：票据形状 → 用工具自己的 key 回读决策（不可达 / 非 200 → `guard_unavailable`）→ `ALLOW` → 回读的 `policyModule / policyFunction` 等于期望策略（`policy_mismatch`）→ 票据 `envelope` 的动作名与资源等于工具自己的映射、按工具自己的映射对**实际收到的参数**重算哈希（`action_mismatch`）→ `consumedBy.attemptId`（`attempt_mismatch`）→ 时间窗（`ticket_expired`）→ 未写结果（`result_recorded`）→ 原子认领 attemptId（`ticket_replayed`）。这是 **at-most-once 放行**：认领后工具崩溃则动作不执行，须重新申请决策。`MemoryAttemptLedger` 重启后 ttl 窗口内同一票据可再被放行一次——多副本或会重启的工具必须提供共享持久存储实现。
 
 > stdio 模式下宿主若同时配置了原始上游，模型可以绕过代理——这是部署配置问题（ADR 0054 §2），由 `auth` 模式兜底、由 #466 部署层测试证明。
 
 ## 绕过套件
 
-`test/bypass/` 是 ADR 0054 §7 的夹具层：`static-no-branch-on-reason`（代码不据 `reason / reasonCode / approvalId / poll / requiredRole` 分支）与 #5（伪造 / 篡改 / 过期收据不 consume）始终启用；#2 / #2b / #3 / #4 / #1b 需要本地 aster-api：
+`test/bypass/` 是 ADR 0054 §7 的夹具层：`static-no-branch-on-reason`（代码不据 `reason / reasonCode / approvalId / poll / requiredRole` 分支）、#5（伪造 / 篡改 / 过期收据不 consume）与 #8 的 mock 版（换策略模块另取 ALLOW 收据，对应 aster-api `B8PolicySwitchBypassTest`）始终启用；#2 / #2b / #3 / #4 / #1b 与 #8 的本地版需要本地 aster-api（含 R68）：
 
 ```bash
 ASTER_GUARD_E2E=1 ASTER_GUARD_BASE_URL=http://localhost:8080 ASTER_GUARD_API_KEY=… ASTER_GUARD_TENANT_ID=… \
@@ -325,7 +327,7 @@ ASTER_GUARD_POLICY=guard.bypass/decide [ASTER_GUARD_LENIENT_POLICY=guard.lenient
 [ASTER_GUARD_EXTRA_HEADERS='{"X-Tenant-Id":"…"}'] pnpm exec vitest run test/bypass
 ```
 
-`ASTER_GUARD_POLICY` 须对 `refund_payment` 给 DENY、其余 ALLOW；`ASTER_GUARD_LENIENT_POLICY`（可选）对一切 ALLOW，用于 #517 换模块用例。夹具层只证明代理逻辑，原始工具端点不可达由部署层证明。
+`ASTER_GUARD_POLICY` 须对 `refund_payment` 给 DENY、其余 ALLOW；`ASTER_GUARD_LENIENT_POLICY`（可选）对一切 ALLOW，用于 #517 换模块用例（#1b 工具侧拒绝、#8 执行方本地 `policy_mismatch` 与改写地址 `bad_signature`）。夹具层只证明代理逻辑，原始工具端点不可达由部署层证明。
 
 ## 服务端 Action 限制
 
@@ -445,6 +447,14 @@ pnpm run build       # tsc → dist/
 ```
 
 提交流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题见 [SECURITY.md](SECURITY.md)。
+
+## 服务端版本要求与回滚
+
+自本版本（R68 地址核对）起，执行方（`GuardClient.run`、`verifyReceipt`、`aster-guard-mcp`）**要求 aster-api 已上线 ADR 0040 §13 R68**（执行收据签名载荷含 `policyModule / policyFunction`，aster-api#539）。缺这两键的收据——R68 之前的 aster-api 签发的，或 R68 上线前已签发、尚在 5 分钟 TTL 内的——一律 `blocked receipt_invalid`（`policy_mismatch`），不 consume、不执行：fail-closed，不会误放行，但全部受守卫动作停摆。
+
+- **升级顺序**：先部署含 R68 的 aster-api，**至少等一个收据 TTL（5 分钟）** 让无地址键的旧收据过期，再升级执行方。0.2.x 执行方在 R68 服务端上照常工作（新增键在签名字节内，0.2.x 不读它们）。
+- **回滚耦合**：aster-api 回滚到 R68 之前（或自托管的 aster-api 没有 R68）时，执行方必须同时钉回 npm 上已发布的 `@aster-cloud/aster-guard@0.2.0`（不含本项核对）；`aster-guard-mcp` 代理镜像钉回本项合入 main 之前构建的镜像 digest。否则全部 `policy_mismatch`。
+- 工具侧 `verifyConsumeTicket` 不读收据地址键，不受此耦合影响。
 
 ## 0.2.0 行为变化
 

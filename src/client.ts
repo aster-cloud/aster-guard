@@ -195,7 +195,8 @@ export class GuardClient {
   }
 
   /**
-   * 核对收据（ADR 0040 §12 D6 + ADR 0054 §11 D12）：expect 给出本次决策 id、本地 actionHash 与同一响应的策略版本 id。
+   * 核对收据（ADR 0040 §12 D6 + ADR 0054 §11 D12 + ADR 0040 §13 R68）：expect 给出本次决策 id、本地 actionHash 与同一响应的
+   * 策略版本 id；期望的策略地址取本客户端配置的 `policyModule / policyFunction`，收据签名覆盖的地址缺失或不符即 `policy_mismatch`。
    * 低层方法，供代理与测试使用；业务代码用 {@link run}。
    */
   verifyReceipt(
@@ -251,7 +252,9 @@ export class GuardClient {
     receipt: unknown,
     expect: { tenantId: string; decisionId: string; actionHash: string; policyVersionId: number | undefined },
   ): Promise<ReceiptCheck> {
-    return verifyExecutionReceipt(receipt, expect, this.jwksCache(), this.now);
+    // 期望地址只取自身配置：决策请求带的也是这两项，收据须证明出自同一 module.function（R68）。
+    const policy = { module: this.policyModule, function: this.policyFunction };
+    return verifyExecutionReceipt(receipt, { ...expect, policy }, this.jwksCache(), this.now);
   }
 
   private jwksCache(): JwksCache {

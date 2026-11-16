@@ -24,6 +24,8 @@ export type Script = 'ALLOW' | 'DENY' | 'PENDING';
 
 interface Stored {
   response: GuardDecision;
+  /** 请求体里的策略地址：回读字段与收据签名载荷（ADR 0040 §13 R68）都取它。 */
+  policy: { module: string; function: string };
   action: unknown;
   actionHash: string;
   pending: boolean;
@@ -55,34 +57,37 @@ export function fakeApi(opts: { tenantId?: string; policyVersionId?: number; now
   const overrides: Override[] = [];
   let revision = 1;
   let mutateReceipt: ((r: ExecutionReceipt) => ExecutionReceipt) | undefined;
+  let rewritePayload: ((p: ExecutionReceiptPayload) => ExecutionReceiptPayload) | undefined;
 
-  const receiptFor = (decisionId: string, actionHash: string): ExecutionReceipt => {
+  // 与 aster-api R68 同形：载荷签名覆盖决策的 policyModule / policyFunction（v 仍为 1）。
+  // rewritePayload 在签名前改载荷（模拟服务端签出的另一地址 / R68 之前的无地址收据），签名仍有效；
+  // mutateReceipt 在签名后改（模拟传输中篡改），验签必然失败。
+  const receiptFor = (decisionId: string, actionHash: string, policy: Stored['policy']): ExecutionReceipt => {
     const t = now();
-    const receipt = signReceipt(
-      {
-        actionHash,
-        decisionId,
-        expiresAt: new Date(t + 300_000).toISOString(),
-        issuedAt: new Date(t).toISOString(),
-        kid: key.kid,
-        outcome: 'ALLOW',
-        policyVersionId,
-        tenantId,
-        v: 1,
-      },
-      key.privateKey,
-      revision,
-    );
+    const signed: ExecutionReceiptPayload = {
+      actionHash,
+      decisionId,
+      expiresAt: new Date(t + 300_000).toISOString(),
+      issuedAt: new Date(t).toISOString(),
+      kid: key.kid,
+      outcome: 'ALLOW',
+      policyFunction: policy.function,
+      policyModule: policy.module,
+      policyVersionId,
+      tenantId,
+      v: 1,
+    };
+    const receipt = signReceipt(rewritePayload ? rewritePayload(signed) : signed, key.privateKey, revision);
     return mutateReceipt ? mutateReceipt(receipt) : receipt;
   };
 
-  const allowOf = (decisionId: string, actionHash: string): GuardDecision => ({
+  const allowOf = (decisionId: string, actionHash: string, policy: Stored['policy']): GuardDecision => ({
     decisionId,
     outcome: 'ALLOW',
     effectiveOutcome: 'ALLOW',
     ruleId: 'R-ALLOW',
     policyVersion: { id: policyVersionId, sourceHash: 'src-hash', version: 1 },
-    executionReceipt: receiptFor(decisionId, actionHash),
+    executionReceipt: receiptFor(decisionId, actionHash, policy),
   });
 
   const json = (status: number, body?: unknown) =>
@@ -94,8 +99,8 @@ export function fakeApi(opts: { tenantId?: string; policyVersionId?: number; now
   function view(s: Stored): GuardDecision {
     return {
       ...s.response,
-      policyModule: 'guard.test',
-      policyFunction: 'decide',
+      policyModule: s.policy.module,
+      policyFunction: s.policy.function,
       ...(s.consumedBy ? { actionHash: s.actionHash, consumedBy: s.consumedBy } : {}),
       ...(s.result ? { result: s.result } : {}),
     };
@@ -111,13 +116,14 @@ export function fakeApi(opts: { tenantId?: string; policyVersionId?: number; now
       return json(200, { keys: [key.jwk], revision });
     }
     if (method === 'POST' && path === '/api/v1/guard/decisions') {
-      const action = (body as { action: unknown }).action;
+      const { action, policyModule, policyFunction } = body as { action: unknown; policyModule: string; policyFunction: string };
+      const policy = { module: policyModule, function: policyFunction };
       const actionHash = jcsSha256(action);
       const decisionId = crypto.randomUUID();
       const script = queue.shift() ?? 'ALLOW';
       const response: GuardDecision =
         script === 'ALLOW'
-          ? allowOf(decisionId, actionHash)
+          ? allowOf(decisionId, actionHash, policy)
           : script === 'DENY'
             ? { decisionId, outcome: 'DENY', effectiveOutcome: 'DENY', reason: '规则拒绝', ruleId: 'R-DENY', controls: ['C-1'] }
             : {
@@ -126,7 +132,7 @@ export function fakeApi(opts: { tenantId?: string; policyVersionId?: number; now
                 effectiveOutcome: 'PENDING',
                 approval: { id: crypto.randomUUID(), status: 'PENDING', expiresAt: '2099-01-01T00:00:00Z', requiredRole: 'DPO' },
               };
-      decisions.set(decisionId, { response, action, actionHash, pending: script === 'PENDING' });
+      decisions.set(decisionId, { response, policy, action, actionHash, pending: script === 'PENDING' });
       return json(200, response);
     }
     const read = /^\/api\/v1\/guard\/decisions\/([^/]+)$/.exec(path);
@@ -184,6 +190,10 @@ export function fakeApi(opts: { tenantId?: string; policyVersionId?: number; now
     mutateReceipts(fn: (r: ExecutionReceipt) => ExecutionReceipt) {
       mutateReceipt = fn;
     },
+    /** 签名前改写后续收据的载荷（签名对改写后的载荷有效）。 */
+    rewritePayloads(fn: (p: ExecutionReceiptPayload) => ExecutionReceiptPayload) {
+      rewritePayload = fn;
+    },
     bumpRevision() {
       revision++;
     },
@@ -191,7 +201,7 @@ export function fakeApi(opts: { tenantId?: string; policyVersionId?: number; now
     approve(decisionId: string) {
       const s = decisions.get(decisionId);
       if (!s) throw new Error(`no decision ${decisionId}`);
-      s.response = { ...allowOf(decisionId, s.actionHash), outcome: 'REQUIRE_APPROVAL', approval: { ...s.response.approval!, status: 'APPROVED' } };
+      s.response = { ...allowOf(decisionId, s.actionHash, s.policy), outcome: 'REQUIRE_APPROVAL', approval: { ...s.response.approval!, status: 'APPROVED' } };
       s.pending = false;
     },
     reject(decisionId: string) {

@@ -4,7 +4,7 @@ import { JwksCache, verifyExecutionReceipt } from '../src/receipt.js';
 import type { ExecutionReceipt, ExecutionReceiptPayload, GuardJwk } from '../src/types.js';
 import { signReceipt, testKey } from './fixtures/fake-api.js';
 
-// 执行收据离线验签（ADR 0040 §12 D6）与 D12 策略版本绑定（ADR 0054 §11.3）。
+// 执行收据离线验签（ADR 0040 §12 D6）、D12 策略版本绑定（ADR 0054 §11.3）与签名覆盖的策略地址（ADR 0040 §13 R68）。
 
 const T0 = Date.parse('2026-11-14T10:00:00Z');
 const ACTION_HASH = hashAction({ principal: { id: 'p' }, action: { name: 'refund' } });
@@ -18,6 +18,8 @@ function payload(extra: Partial<ExecutionReceiptPayload> = {}): ExecutionReceipt
     issuedAt: new Date(T0).toISOString(),
     kid: 'k-1',
     outcome: 'ALLOW',
+    policyFunction: 'decide',
+    policyModule: 'guard.strict',
     policyVersionId: 7,
     tenantId: 't-1',
     v: 1,
@@ -32,7 +34,13 @@ function harness(keys: GuardJwk[] = [key.jwk], clock = { t: T0 }) {
     fetches++;
     return fail ? undefined : { revision: 1, keys };
   }, () => clock.t);
-  const expect0 = { tenantId: 't-1', decisionId: 'd-1', actionHash: ACTION_HASH, policyVersionId: 7 as number | undefined };
+  const expect0 = {
+    tenantId: 't-1',
+    decisionId: 'd-1',
+    actionHash: ACTION_HASH,
+    policy: { module: 'guard.strict', function: 'decide' },
+    policyVersionId: 7 as number | undefined,
+  };
   return {
     cache,
     clock,
@@ -61,6 +69,8 @@ describe('verifyExecutionReceipt', () => {
       { issuedAt: new Date(T0 + 1).toISOString() },
       { policyVersionId: 8 },
       { tenantId: 't-2' },
+      { policyModule: 'guard.strict2' },
+      { policyFunction: 'decide2' },
     ];
     for (const change of tampered) {
       const r: ExecutionReceipt = { ...good, payload: { ...good.payload, ...change } };
@@ -110,6 +120,60 @@ describe('verifyExecutionReceipt', () => {
     void _omit;
     const r = signReceipt(rest as ExecutionReceiptPayload, key.privateKey);
     expect(await harness().verify(r)).toEqual(bad('policy_mismatch'));
+  });
+
+  describe('R68 签名覆盖的策略地址（#517）', () => {
+    it('地址与期望一致 → 通过', async () => {
+      expect(await harness().verify(signReceipt(payload(), key.privateKey))).toEqual(ok);
+    });
+
+    it.each([
+      ['模块不同', { policyModule: 'guard.lenient' }],
+      ['函数不同', { policyFunction: 'decideLenient' }],
+      ['大小写不同', { policyModule: 'Guard.Strict' }],
+      ['空串', { policyModule: '' }],
+    ])('签名有效但%s → policy_mismatch', async (_name, change) => {
+      const r = signReceipt(payload(change), key.privateKey);
+      expect(await harness().verify(r)).toEqual(bad('policy_mismatch'));
+    });
+
+    it.each(['policyModule', 'policyFunction'] as const)('缺 %s（R68 之前的 aster-api 签发）→ policy_mismatch，fail-closed', async (k) => {
+      const { [k]: _omit, ...rest } = payload();
+      void _omit;
+      const r = signReceipt(rest as ExecutionReceiptPayload, key.privateKey);
+      expect(await harness().verify(r)).toEqual(bad('policy_mismatch'));
+    });
+
+    it('两键都缺 → policy_mismatch', async () => {
+      const { policyModule: _m, policyFunction: _f, ...rest } = payload();
+      void _m;
+      void _f;
+      expect(await harness().verify(signReceipt(rest as ExecutionReceiptPayload, key.privateKey))).toEqual(bad('policy_mismatch'));
+    });
+
+    it('签名后把地址改成期望值（换模块收据冒充）→ bad_signature', async () => {
+      const lenient = signReceipt(payload({ policyModule: 'guard.lenient' }), key.privateKey);
+      const forged = { ...lenient, payload: { ...lenient.payload, policyModule: 'guard.strict' } };
+      expect(await harness().verify(forged)).toEqual(bad('bad_signature'));
+    });
+
+    it('签名后删掉地址键 → bad_signature（不会落成 policy_mismatch 以外的放行）', async () => {
+      const good = signReceipt(payload(), key.privateKey);
+      const { policyModule: _m, ...stripped } = good.payload;
+      void _m;
+      expect(await harness().verify({ ...good, payload: stripped })).toEqual(bad('bad_signature'));
+    });
+
+    it('地址键不是字符串 → malformed', async () => {
+      const r = signReceipt({ ...payload(), policyModule: 7 as unknown as string }, key.privateKey);
+      expect(await harness().verify(r)).toEqual(bad('malformed'));
+    });
+
+    it('地址一致但 policyVersionId 不符 → 仍 policy_mismatch（R66 核对保留）', async () => {
+      const h = harness();
+      const r = signReceipt(payload(), key.privateKey);
+      expect(await h.verify(r, { ...h.expect0, policyVersionId: 8 })).toEqual(bad('policy_mismatch'));
+    });
   });
 
   it('malformed：外层 kid 与 payload.kid 不同 / 缺字段', async () => {
